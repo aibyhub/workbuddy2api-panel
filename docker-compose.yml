@@ -1,11 +1,14 @@
 # WorkBuddy2API Panel
-# 使用 GitHub Container Registry 的固定版本镜像
+# 使用 GitHub Container Registry 的固定版本镜像；版本号随源码 appVersion 自动发布。
 # 部署：
 #   docker compose pull
 #   docker compose up -d --wait
+#
+# 无需本地 .env；如需要 PUID/PGID，可直接在 1Panel Compose 环境变量中设置，
+# 或在本级创建 .env。默认 user 已固定为 10001:10001。
 services:
   workbuddy2api:
-    image: ghcr.io/aibyhub/workbuddy2api-panel:1.11.6-panel
+    image: ghcr.io/aibyhub/workbuddy2api-panel:1.11.10-panel
     container_name: workbuddy2api-panel
     restart: unless-stopped
     mem_limit: 512m
@@ -16,13 +19,9 @@ services:
     # 1Panel / Nginx 从宿主机回源到这里：宿主机 8082 → 容器 7863
     ports:
       - "127.0.0.1:8082:7863"
-    env_file:
-      - .env
     environment:
-      TZ: ${TZ:-Asia/Shanghai}
-    # 镜像默认用户为 app:app（10001:10001）。
-    # 如需调整挂载目录权限，可在服务器 .env 中设置 PUID/PGID。
-    user: "${PUID:-10001}:${PGID:-10001}"
+      TZ: Asia/Shanghai
+    user: "10001:10001"
     volumes:
       # OAuth 账号凭证，必须持久化。
       - ./auths:/app/auths

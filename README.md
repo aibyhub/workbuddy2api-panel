@@ -232,7 +232,7 @@ mkdir -p auths data && cp config.example.json config.json
 docker run -d --name workbuddy2api \
   -p 7863:7863 -e TZ=Asia/Shanghai \
   -v ./auths:/app/auths -v ./data:/app/data -v ./config.json:/app/config.json \
-  ghcr.io/linguo2625469/workbuddy2api-panel:latest
+  ghcr.io/aibyhub/workbuddy2api-panel:latest
 
 # 3. 健康检查（无可用账号时返回 503）
 curl -s http://localhost:7863/healthz
@@ -241,22 +241,24 @@ curl -s http://localhost:7863/healthz
 > **首次发布后须将包设为公开**：GitHub 仓库页 → Packages → `workbuddy2api-panel` →
 > Package settings → Change visibility → Public，否则拉取需要 `docker login ghcr.io`。
 >
-> 镜像 tag 规则：`main` 分支推送 `latest` / `main` / `sha-xxxxxx`；打 `v*` tag 额外发布
-> `1.2.3` / `1.2` / `1` 语义化版本；PR 仅构建验证、不推送。
+> 镜像 tag 规则：版本 tag 唯一来源是 `cmd/server/main.go` 中的 `appVersion`，例如源码为
+> `1.11.10-panel` 时会发布同名镜像 tag；`main` 分支同时推送 `latest` / `main` / `sha-xxxxxx`。
+> 打 `v1.11.10` tag 时还会发布 `1.11.10` / `1.11`；PR 仅构建验证、不推送。
+> 演练 tag 只接受 `v<source>-ci`，仅跑测试与构建，不推送 GHCR / Release。
 
 ### 方式一：Docker Compose（推荐服务器部署）
 
 ```bash
 # 1. 克隆
-git clone https://github.com/linguo2625469/workbuddy2api-panel.git
+git clone https://github.com/aibyhub/workbuddy2api-panel.git
 cd workbuddy2api-panel
 
 # 2. 准备配置（compose 挂载此文件，缺失会导致容器启动失败）
 cp config.example.json config.json
 #    建议编辑 config.json 设置 api_key（或留空由程序自动生成随机密钥）
 
-# 3. 启动（首次会构建镜像，约 1-2 分钟）
-docker compose up -d --build
+# 3. 启动
+docker compose up -d --wait
 
 # 4. 健康检查（无可用账号时返回 503）
 curl -s http://localhost:7863/healthz
@@ -265,12 +267,22 @@ curl -s http://localhost:7863/healthz
 
 启动后打开 **`http://localhost:7863/panel/`**，用面板「添加账号」完成登录（见下节）。
 
+> 本仓库 `docker-compose.yml` 不依赖本地 `.env`；`PUID/PGID` 已在 compose 中固定为 `10001:10001`，
+> 如需调整请在 1Panel 环境变量中配置，无需额外创建 `.env`。
+
 常用运维命令：
 
 ```bash
 docker compose logs -f          # 跟踪日志
 docker compose restart          # 重启
 docker compose down             # 停止并移除容器（数据在 ./auths 与 ./data，不受影响）
+```
+
+后续代码升级后，CI 会自动按最新源码 `appVersion` 构建新镜像；服务器升级时：
+
+```bash
+docker compose pull
+docker compose up -d --wait
 ```
 
 ### 方式二：Windows 单文件运行（无需 Docker）
@@ -735,9 +747,9 @@ python3 scripts/probe_max_tokens.py   --base http://127.0.0.1:7863/v1 --key sk-x
 
 ### 3. 发布来源与合规边界
 
-- **无预编译 release**：仓库无 Release / tag，产物 = 源码自构建（Dockerfile 多阶段在本地构建时完成）
+- **自动发布**：push 到 `main` 会由 GitHub Actions 构建并发布 `linux/amd64`、`linux/arm64` GHCR 镜像；版本 tag 自动读取源码 `appVersion`
 - 登录 / 签到 / 积分工具：`./login.sh` / `./signin.sh` / `./credit.sh`
-- **无产物校验和**：`go.sum` 仅约束 Go 模块依赖；Docker 镜像由本地 `docker compose build` 生成，未引用第三方镜像
+- **二进制 Release**：打与源码版本匹配的 `v*` tag 后，GitHub Actions 发布 Windows、Linux、macOS 五平台压缩包及 checksums；Docker 镜像仍以 GHCR 为准
 - 上游 CodeBuddy 属腾讯系商业产品，本项目是其**非官方 OpenAI 兼容网关**；使用其账号做 API 网关涉及目标平台服务条款与账号风险，作者不对账号封禁、条款违约或使用结果负责
 
 ### 4. 授权使用边界

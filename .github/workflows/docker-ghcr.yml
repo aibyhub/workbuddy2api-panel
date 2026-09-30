@@ -3,11 +3,15 @@ name: docker-ghcr
 # 多架构镜像（amd64/arm64）自动构建并发布到 ghcr.io：
 #   - push 到 main / 打 v* tag / 手动触发 → 构建并推送
 #   - PR 触碰构建相关文件 → 仅构建验证，不推送
-# tag 说明：main 推 latest + main + sha-xxxxxx；v1.2.3 推 1.2.3 / 1.2 / 1
+# 版本 tag 唯一来源：cmd/server/main.go 中的 appVersion；不再维护固定版本常量。
+# main 会额外推源码版本 tag、latest、main、sha-xxxxxx；v1.2.3 还会推 1.2.3 / 1.2。
 on:
   push:
-    branches: [main]
-    tags: ["v*"]
+    branches:
+      - main
+    tags:
+      - "v[0-9]+.[0-9]+.[0-9]+"
+      - "v[0-9]+.[0-9]+.[0-9]+-ci"
   pull_request:
     paths:
       - "Dockerfile"
@@ -30,7 +34,7 @@ concurrency:
 
 env:
   REGISTRY: ghcr.io
-  # github.repository 自动小写化，得到 ghcr.io/linguo2625469/workbuddy2api-panel
+  # github.repository 自动小写化，得到 ghcr.io/aibyhub/workbuddy2api-panel
   IMAGE_NAME: ${{ github.repository }}
 
 jobs:
@@ -42,6 +46,51 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Read source version
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+          mapfile -t versions < <(grep -oP 'const appVersion = "\K[^" ]+' cmd/server/main.go | tr -d '\r' || true)
+          if (( ${#versions[@]} != 1 )); then
+            echo "::error::expected exactly one appVersion in cmd/server/main.go, found ${#versions[@]}"
+            exit 1
+          fi
+          version="${versions[0]}"
+          if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z._-]+)?$ ]]; then
+            echo "::error::invalid appVersion: $version"
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "source version: $version"
+
+      - name: Validate release tag
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          SOURCE_VERSION: ${{ steps.version.outputs.version }}
+          REF_NAME: ${{ github.ref_name }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          source_version="${SOURCE_VERSION%-panel}"
+          tag_version="${REF_NAME#v}"
+          if [[ "$REF_NAME" == *-ci ]]; then
+            if [[ "$tag_version" != "${source_version}-ci" ]]; then
+              echo "::error::CI rehearsal tag must be v<source>-ci, got $REF_NAME (expected v${source_version}-ci)"
+              exit 1
+            fi
+            echo "CI rehearsal tag detected: $REF_NAME (no GHCR publish in this job)"
+            exit 0
+          fi
+          if [[ "$tag_version" != "$source_version" ]]; then
+            echo "::error::tag $REF_NAME does not match appVersion=$SOURCE_VERSION (expected v$source_version)"
+            exit 1
+          fi
+          echo "release tag OK: $REF_NAME"
+
+      - name: Run tests
+        run: go test ./...
 
       - name: Set up QEMU（arm64 交叉模拟）
         uses: docker/setup-qemu-action@v3
@@ -63,6 +112,7 @@ jobs:
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           tags: |
+            type=raw,value=${{ steps.version.outputs.version }}
             type=raw,value=latest,enable={{is_default_branch}}
             type=ref,event=branch
             type=semver,pattern={{version}}
@@ -70,11 +120,15 @@ jobs:
             type=sha,format=short
 
       - name: Build and push
+        if: >
+          github.event_name == 'push' && github.ref == 'refs/heads/main' ||
+          github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') && !endsWith(github.ref_name, '-ci') ||
+          github.event_name == 'workflow_dispatch'
         uses: docker/build-push-action@v6
         with:
           context: .
           platforms: linux/amd64,linux/arm64
-          push: ${{ github.event_name != 'pull_request' }}
+          push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha
