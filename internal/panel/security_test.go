@@ -70,12 +70,22 @@ func TestIndexReferencesExternalScript(t *testing.T) {
 	p.ServeHTTP(rec, httptest.NewRequest("GET", "/panel/", nil))
 	body := rec.Body.String()
 
-	if !strings.Contains(body, `<script src="app.js"></script>`) {
-		t.Error("index.html must load app.js externally (inline script is blocked by CSP)")
+	// 外链脚本（CSP 禁内联）：配置了版本号时 src 带版本 query——发版即新 URL，
+	// 绕开 Cloudflare 对 .js 的边缘缓存（实测 cf-cache-status:HIT 吐旧脚本）。
+	if !strings.Contains(body, `<script src="app.js?v=test"></script>`) {
+		t.Error("versioned panel must reference app.js with version query")
 	}
 	// 反例保护：出现内联 <script>...</script> 内容块即为回归
 	if strings.Contains(body, "<script>\n") || strings.Contains(body, "<script> ") {
 		t.Error("index.html still contains an inline <script> block; CSP would block it")
+	}
+
+	// 未配置版本号（测试裸用）时回落裸 app.js，页面不空引用。
+	p2 := New(Config{})
+	rec2 := httptest.NewRecorder()
+	p2.ServeHTTP(rec2, httptest.NewRequest("GET", "/panel/", nil))
+	if !strings.Contains(rec2.Body.String(), `<script src="app.js"></script>`) {
+		t.Error("unversioned panel must keep the bare app.js reference")
 	}
 }
 
