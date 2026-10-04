@@ -112,11 +112,13 @@ jobs:
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           tags: |
-            # 源码版本 tag（如 1.11.12-panel）只在 v* 发版 tag 推送时发布——main 每次
-            # push 都覆盖同名 tag 会让「compose 固定版本号」失去可复现性（同 tag 不同
-            # digest，回滚时拿到的已不是当时的镜像）。main push 用 sha-/main/latest。
+            # 源码版本 tag（如 1.11.15-panel）与 latest 仅在 v* 发版 tag 推送时发布：
+            # 1) main 每次 push 覆盖同名版本 tag 会让「compose 固定版本号」失去可复现性；
+            # 2) main push 与紧随的发版 tag 构建并发时，两者同时推送 latest/sha- 共享
+            #    tag 会产生 GHCR manifest 竞态（实测 main run Build and push failure、
+            #    tag run success）。latest 随发版走，main 只推 main/sha-。
             type=raw,value=${{ steps.version.outputs.version }},enable=${{ startsWith(github.ref, 'refs/tags/v') }}
-            type=raw,value=latest,enable={{is_default_branch}}
+            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') && !endsWith(github.ref_name, '-ci') }}
             type=ref,event=branch
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
