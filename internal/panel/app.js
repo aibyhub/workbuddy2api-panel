@@ -69,8 +69,20 @@ function esc(s) {
     .replace(/'/g, '&#39;');
 }
 function ago(iso) {
-  if (!iso || iso.startsWith('0001-')) return '—';
-  const s = (Date.now() - new Date(iso)) / 1000;
+  // 兼容两种形态：Go time.Time 的 ISO 字符串（账号最近成功）与 unix 秒数字
+  // （代理池 checked_at）——此前数字形态走 startsWith 直接 TypeError，整个
+  // 代理池列表渲染失败（"读取失败：iso.startsWith is not a function"）。
+  if (iso == null || iso === '') return '—';
+  let ms;
+  if (typeof iso === 'number') {
+    if (!Number.isFinite(iso) || iso <= 0) return '—';
+    ms = iso * 1000;
+  } else {
+    if (iso.startsWith('0001-')) return '—';
+    ms = Date.parse(iso);
+  }
+  if (!Number.isFinite(ms)) return '—';
+  const s = (Date.now() - ms) / 1000;
   if (s < 0) return '刚刚';
   if (s < 60) return Math.floor(s) + ' 秒前';
   if (s < 3600) return Math.floor(s / 60) + ' 分钟前';
