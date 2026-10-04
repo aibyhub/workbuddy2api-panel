@@ -245,7 +245,7 @@ func Default() *Config {
 	// ChatBase/BillingBase 缺省空（回落内置默认）。
 	c.Global.Enabled = true
 	c.Features.SanitizeBlacklistFingerprints = true
-	c.Prompt.Mode = "passthrough" // 缺省 passthrough：透传客户端原始 system（对齐上游；custom 由用户显式选择）
+	c.Prompt.Mode = "demote" // 缺省 demote：system 恒定网关提示词 + 调用方 system 降级为对话首条 user（工具协议保留、指纹挪出 system 区）
 	c.Pool.MaxInFlight = 3
 	// MaxInFlightGlobal 缺省 2：global 域 WAF 风控更紧，压低单号并发（WAF 403 修复
 	// P1-1）；0/负数 normalize 回落默认（与 max_in_flight 的 0=不限语义不同，分档键
@@ -567,16 +567,20 @@ func (c *Config) normalize() error {
 // passthrough 模式不加载文本（透传客户端原始 system，文本在降级时用 prompt.Degraded）。
 func (c *Config) normalizePrompt() error {
 	switch m := strings.ToLower(strings.TrimSpace(c.Prompt.Mode)); m {
-	case "", "passthrough":
+	case "":
+		c.Prompt.Mode = "demote"
+	case "passthrough":
 		c.Prompt.Mode = "passthrough"
 	case "custom":
 		c.Prompt.Mode = "custom"
 	case "append":
 		c.Prompt.Mode = "append"
+	case "demote":
+		c.Prompt.Mode = "demote"
 	default:
-		return fmt.Errorf("prompt.mode: %q 不是合法值（passthrough / custom / append）", c.Prompt.Mode)
+		return fmt.Errorf("prompt.mode: %q 不是合法值（passthrough / custom / append / demote）", c.Prompt.Mode)
 	}
-	if c.Prompt.Mode == "custom" || c.Prompt.Mode == "append" {
+	if c.Prompt.Mode == "custom" || c.Prompt.Mode == "append" || c.Prompt.Mode == "demote" {
 		text, err := prompt.Load(c.Prompt.Mode, c.Prompt.File)
 		if err != nil {
 			return err

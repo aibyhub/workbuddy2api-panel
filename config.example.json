@@ -54,7 +54,7 @@
     "sanitize_blacklist_fingerprints": true
   },
   "prompt": {
-    "mode": "passthrough",
+    "mode": "demote",
     "file": ""
   },
   "upstash": {

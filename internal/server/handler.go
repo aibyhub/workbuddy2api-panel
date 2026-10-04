@@ -129,7 +129,7 @@ func NewHandler(cfg Config) *Handler {
 		cfg.RefreshSkew = 10 * time.Minute
 	}
 	if cfg.PromptMode == "" {
-		cfg.PromptMode = "custom" // 缺省 custom：网关自有提示词
+		cfg.PromptMode = "demote" // 缺省 demote：system 恒定网关提示词 + 调用方 system 降级为对话首条 user
 	}
 	h := &Handler{cfg: cfg, mux: http.NewServeMux()}
 	h.mux.HandleFunc("POST /v1/chat/completions", h.withAuth(h.chatCompletions))
@@ -653,19 +653,28 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// 系统提示词改写（出站前、轮转前；每个请求一次）。
-	//   - custom：用自有提示词替换客户端 system/developer（从源头消灭 system 指纹误报）。
+	//   - demote（缺省）：system 恒定用自有提示词替换客户端 system/developer；
+	//     调用方 system 原文降级为对话开头的一条 user 消息（prompt.Demote）——
+	//     纯提示词驱动的 agent（工具协议写在 system 里）保住工具调用能力，
+	//     agent 指纹同时从风控重点盯防的 system 区挪到宽松的对话区。
+	//   - custom：用自有提示词替换客户端 system/developer（调用方原文丢弃）。
 	//   - append：开头连续 system/developer 块后插自有提示词，既有消息逐字不动
 	//     （客户端项目规范/工具约定与网关提示词并用，issue #129）。
 	//   - passthrough + 降级期：换 Degraded 中性提示词直达，不再先撞 400。
-	//   - passthrough / append 非降级期：透传客户端原始 system（append 则再插一条网关 system）。
+	//   - passthrough / append / demote 非降级期：透传客户端原始 system
+	//     （append 则再插一条网关 system；demote 恒定改写）。
 	// 降级裁决：append 在降级期退化为 replace（Rewrite(Degraded)）——append 带
 	// 指纹原文重试是确定性再撞墙，replace 是一次性最小抢救（issue #129 设计 §4）。
+	// demote 无降级分支：其 system 已是网关固定文本，无指纹可降。
 	degradedApplied := false
-	if h.cfg.PromptMode == "custom" && h.cfg.PromptText != "" {
+	switch {
+	case h.cfg.PromptMode == "demote" && h.cfg.PromptText != "":
+		body = prompt.Demote(body, h.cfg.PromptText)
+	case h.cfg.PromptMode == "custom" && h.cfg.PromptText != "":
 		body = prompt.Rewrite(body, h.cfg.PromptText)
-	} else if h.cfg.PromptMode == "append" && h.cfg.PromptText != "" && !h.degrade.Active() {
+	case h.cfg.PromptMode == "append" && h.cfg.PromptText != "" && !h.degrade.Active():
 		body = prompt.Append(body, h.cfg.PromptText)
-	} else if (h.cfg.PromptMode == "passthrough" || h.cfg.PromptMode == "append") && h.degrade.Active() {
+	case (h.cfg.PromptMode == "passthrough" || h.cfg.PromptMode == "append") && h.degrade.Active():
 		body = prompt.Rewrite(body, prompt.Degraded)
 		degradedApplied = true
 	}
@@ -802,12 +811,13 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				kind = upstream.Classify(status, string(respBody))
 				uerr = &upstream.Error{Kind: kind, Status: status, Msg: string(respBody)}
 			}
-			// 内容拦截误报（passthrough/append 模式首遇）：判定为 system 指纹误报，
+			// 内容拦截误报（passthrough/append/demote 模式首遇）：判定为指纹误报，
 			// 触发降级到次日 00:00 CST，换 Degraded 中性提示词同请求内重试（append
-			// 降级重试同样退化为 replace——原文在场只会确定性再撞 400）。
+			// 降级重试同样退化为 replace——原文在场只会确定性再撞 400；demote 的
+			// 降级块在对话区，被拦时同样整体退到 Degraded 抢救一次）。
 			// 第二次仍被拦（用户内容本身触发审核）→ 回内容防火墙错误（见下分支）。
 			// 内容问题非账号问题：applyErrorPolicy 不罚账号（见 ErrContentBlocked 分支）。
-			if kind == upstream.ErrContentBlocked && (h.cfg.PromptMode == "passthrough" || h.cfg.PromptMode == "append") && !degradedApplied {
+			if kind == upstream.ErrContentBlocked && (h.cfg.PromptMode == "passthrough" || h.cfg.PromptMode == "append" || h.cfg.PromptMode == "demote") && !degradedApplied {
 				h.degrade.Trigger()
 				body = prompt.Rewrite(body, prompt.Degraded)
 				degradedApplied = true

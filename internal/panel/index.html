@@ -1035,6 +1035,7 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
             <div class="grid2">
               <label class="fld"><span class="lb">系统提示词模式</span>
                 <select name="prompt_mode">
+                  <option value="demote">demote — system 恒定网关提示词，调用方 system 降级为对话消息（默认，工具协议保留）</option>
                   <option value="custom">custom — 网关自有提示词（避免指纹误报）</option>
                   <option value="append">append — 客户端 system 后插网关提示词（并用）</option>
                   <option value="passthrough">passthrough — 透传客户端原始 system</option>

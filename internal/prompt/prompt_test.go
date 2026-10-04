@@ -222,3 +222,49 @@ func TestLoadFileMissingFailsFast(t *testing.T) {
 		t.Fatal("missing file should return error (fail fast)")
 	}
 }
+
+// TestDemote demote 模式：system 恒定网关提示词；调用方 system 原文降级为
+// 对话首条 user 消息（工具协议保留、指纹挪出 system 区）；其余消息逐字不动。
+func TestDemote(t *testing.T) {
+	body := []byte(`{"model":"m","messages":[
+		{"role":"system","content":"HARNESS-PROTO run_code is the only tool"},
+		{"role":"system","content":"第二条 system"},
+		{"role":"user","content":"帮我写个脚本"}]}`)
+	out := Demote(body, "你是 WorkBuddy 网关提示词。")
+	var obj struct {
+		Messages []struct {
+			Role    string `json:"role"`
+			Content any    `json:"content"`
+		} `json:"messages"`
+	}
+	if err := json.Unmarshal(out, &obj); err != nil {
+		t.Fatal(err)
+	}
+	if len(obj.Messages) != 3 {
+		t.Fatalf("want 3 messages (system + demoted user + user), got %d", len(obj.Messages))
+	}
+	if obj.Messages[0].Role != "system" {
+		t.Fatalf("first role=%s", obj.Messages[0].Role)
+	}
+	sys, _ := obj.Messages[0].Content.(string)
+	if sys != "你是 WorkBuddy 网关提示词。" {
+		t.Fatalf("system must be the gateway prompt, got %q", sys)
+	}
+	if obj.Messages[1].Role != "user" {
+		t.Fatalf("demoted block must be user role, got %s", obj.Messages[1].Role)
+	}
+	demoted, _ := obj.Messages[1].Content.(string)
+	if !strings.Contains(demoted, "HARNESS-PROTO run_code") || !strings.Contains(demoted, "第二条 system") {
+		t.Fatalf("demoted block must carry all caller system content: %q", demoted)
+	}
+	if !strings.Contains(demoted, "[调用方随请求附带的环境说明与工具协议") {
+		t.Fatal("demoted block must carry the wrapper marker")
+	}
+	if obj.Messages[2].Role != "user" {
+		t.Fatalf("original user must be preserved, got %s", obj.Messages[2].Role)
+	}
+	// 空 systemPrompt → 原样返回（守卫与 Rewrite 一致）
+	if string(Demote(body, "")) != string(body) {
+		t.Fatal("empty gateway prompt must return body unchanged")
+	}
+}
