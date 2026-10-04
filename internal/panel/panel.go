@@ -97,6 +97,10 @@ type Panel struct {
 	// 见 spawnFamilyBatch。
 	familyMu    sync.Mutex
 	familyLocks map[string]*sync.Mutex
+
+	// indexHTMLVersioned 页面骨架副本：script src 版本化（?v=<appVersion>），
+	// 发版即新 URL，绕开 Cloudflare/浏览器对 /panel/app.js 的存量缓存（见 index 注释）。
+	indexHTMLVersioned []byte
 }
 
 // tryLockAccount 尝试锁定账号的任务执行；已在执行返回 false。
@@ -145,6 +149,12 @@ func New(cfg Config) *Panel {
 		started: time.Now(),
 		logs:    NewRing(500),
 		logins:  map[string]loginSession{},
+	}
+	// script src 版本化：仅当版本号非空（测试裸用 Panel{} 时保持原样）。
+	if cfg.Version != "" {
+		p.indexHTMLVersioned = []byte(strings.Replace(string(indexHTML), `src="app.js"`, `src="app.js?v=`+cfg.Version+`"`, 1))
+	} else {
+		p.indexHTMLVersioned = indexHTML
 	}
 	p.routes()
 	return p

@@ -47,12 +47,15 @@ func setSecurityHeaders(w http.ResponseWriter) {
 // index 输出面板页面（静态无秘密；数据接口 /panel/api/* 才走鉴权）。
 // no-store：无版本化 URL/ETag，启发式缓存会让浏览器在网关升级后继续跑旧
 // app.js（实测：修复已发版，浏览器仍报旧脚本的 iso.startsWith TypeError）。
+// script src 版本化（app.js?v=<appVersion>）：源站补 no-store 之前 Cloudflare
+// 已按扩展名缓存了 .js（实测 cf-cache-status:HIT 吐旧脚本，浏览器刷新无效）——
+// 版本号一变 URL 即新，CDN/浏览器缓存双双失效，此后每次发版自动生效。
 func (p *Panel) index(w http.ResponseWriter, r *http.Request) {
 	setSecurityHeaders(w)
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-store")
 	w.WriteHeader(http.StatusOK)
-	_, _ = w.Write(indexHTML)
+	_, _ = w.Write(p.indexHTMLVersioned)
 }
 
 // appScript 输出前端逻辑（同源脚本，供 CSP script-src 'self' 加载）。
