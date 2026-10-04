@@ -52,11 +52,38 @@ func bestUsageCacheHitTokens(usage map[string]any) (float64, bool) {
 		} else if details, ok := usage[path.section].(map[string]any); ok {
 			value = details[path.key]
 		}
-		if tokens, ok := positiveUsageNumber(value); ok {
+		if tokens, ok := nonNegativeUsageNumber(value); ok {
 			return tokens, true
 		}
 	}
 	return 0, false
+}
+
+// nonNegativeUsageNumber 数值键「存在即有效」：0 也是可信观测值（上游显式回
+// hit=0 = 该请求确实无缓存命中）。统计层（命中率分母）必须计入 hit=0 的样本，
+// 否则全 miss 请求被系统性排除、命中率虚高。normalizeUsageCacheAliases 对
+// best<=0 原样返回，客户端回写口径不受本函数影响。
+func nonNegativeUsageNumber(value any) (float64, bool) {
+	switch n := value.(type) {
+	case float64:
+		return n, true
+	case float32:
+		return float64(n), true
+	case int:
+		return float64(n), true
+	case int64:
+		return float64(n), true
+	case int32:
+		return float64(n), true
+	case uint:
+		return float64(n), true
+	case uint64:
+		return float64(n), true
+	case uint32:
+		return float64(n), true
+	default:
+		return 0, false
+	}
 }
 
 func positiveUsageNumber(value any) (float64, bool) {

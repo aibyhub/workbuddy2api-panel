@@ -14,6 +14,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 
@@ -31,7 +32,7 @@ import (
 )
 
 // appVersion 网关版本（fork 版：面板 + 任务体系），透出到 /panel/api/overview。
-const appVersion = "1.11.11-panel"
+const appVersion = "1.11.12-panel"
 
 // usagePathFor 由 state 文件路径推出用量文件路径：同目录、文件名 usage.json。
 // 这样 config 里改 state_file 时用量数据跟着走，不需要额外配置项。
@@ -159,6 +160,8 @@ func main() {
 	up.DeviceToken = cfg.Upstream.DeviceToken
 	up.DeviceTokenFile = cfg.Upstream.DeviceTokenFile
 	up.PassthroughIP = cfg.Upstream.PassthroughIP
+	// 全局兜底出口代理（config upstream.proxy_url）：账号 auth proxy_url 优先于本项。
+	up.SetGlobalProxyURL(cfg.Upstream.ProxyURL)
 	// global realm 路由（config global 段）：上游侧开关（第一道闸）+ base 覆盖；
 	// auth 侧开关（auth.SetGlobalEnabled）是第二道闸，两者同 config global.enabled。
 	up.GlobalEnabled = cfg.Global.Enabled
@@ -269,6 +272,9 @@ func main() {
 		StickyCount: sessCount,
 		Version:     appVersion,
 		Live:        live,
+		// 代理池：与 state 文件同目录持久化（data/proxies.json），账号级出口指派 +
+		// 新账号自动均衡分配的数据源。
+		Proxies: panel.NewProxyPool(stateSibling(cfg.StateFile, "proxies.json")),
 		// 模型上限探测数据（scripts/probe_max_tokens.py --panel-out 写入）：
 		// 与 state 文件同目录，缺省 data/output_probes.json。
 		ProbeFile:  stateSibling(cfg.StateFile, "output_probes.json"),
@@ -336,7 +342,9 @@ func main() {
 	go func() {
 		<-ctx.Done()
 		p.Flush() // 信号触发：先落盘再做优雅停机
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		// 25s ≈ compose stop_grace_period 30s 留 5s 余量：流式生成合法时长数分钟，
+		// 5s 的旧值会把所有在途 SSE 在部署/重启时拦腰切断（客户端侧表现为截断流）。
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
 		defer cancel()
 		_ = srv.Shutdown(shutdownCtx)
 	}()
@@ -432,6 +440,12 @@ func saveConfig(raw []byte, path string, live *livecfg.Holder, p *pool.Pool, up 
 	if err != nil {
 		return nil, err
 	}
+	// 面板保存路径额外校验 api_key 非空：清空会使网关与面板同时热生效为「无鉴权」，
+	// 属一键裸奔。启动路径不校验（保持「空 = 不鉴权」的既有语义与存量部署兼容），
+	// 执意免密部署的运维可手改配置文件。
+	if err := validateSaveAPIKey(newCfg); err != nil {
+		return nil, err
+	}
 
 	// 3) 落盘（原子替换）。
 	out, err := json.MarshalIndent(merged, "", "  ")
@@ -479,6 +493,7 @@ func saveConfig(raw []byte, path string, live *livecfg.Holder, p *pool.Pool, up 
 		RecordClientInfo:     newCfg.Logging.RequestClientInfo,
 	})
 	up.SanitizeFingerprints.Store(newCfg.Features.SanitizeBlacklistFingerprints)
+	up.SetGlobalProxyURL(newCfg.Upstream.ProxyURL) // 全局兜底代理热生效
 	p.SetBreaker(newCfg.Pool.BreakerThreshold, newCfg.BreakerCooldownDur, newCfg.BreakerCooldownMaxD)
 	p.SetMaxInFlight(newCfg.Pool.MaxInFlight)
 	p.SetMaxInFlightGlobal(newCfg.Pool.MaxInFlightGlobal)
@@ -499,6 +514,15 @@ func saveConfig(raw []byte, path string, live *livecfg.Holder, p *pool.Pool, up 
 	sch.SetBalanceInterval(newCfg.BalanceRefreshInterval)
 
 	return restartRequiredFields(newCfg), nil
+}
+
+// validateSaveAPIKey 面板保存配置的 api_key 非空闸（清空 = 网关+面板同时裸奔）。
+// 独立成函数便于测试；空白字符视为空。
+func validateSaveAPIKey(c *Config) error {
+	if strings.TrimSpace(c.APIKey) == "" {
+		return fmt.Errorf("api_key 不能为空：清空会使网关与面板同时失去鉴权")
+	}
+	return nil
 }
 
 // restartRequiredFields 返回本次改动中无法热生效、需要重启进程的字段名。

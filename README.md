@@ -405,8 +405,8 @@ curl -s http://localhost:7863/v1/chat/completions \
 | `pool.breaker_cooldown_max` | `6h` | 熔断指数退避封顶 |
 | `pool.idle_weight_per_hour` | `0.5` | 闲置补偿：每小时未使用 +0.5 权重 |
 | `pool.idle_weight_max` | `5.0` | 闲置补偿权重封顶 |
-| `pool.prefer_expiring` | `true` | 最早到期优先：窗口内存在快过期积分时，按最近到期时间升序选择账号（同时间剩余积分多者优先） |
-| `pool.expiring_soon` | `168h` | 快过期路由窗口：仅此窗口内的批次参与最早到期优先；留空或 `0` 关闭 |
+| `pool.prefer_expiring` | `true` | 最早到期优先：`expiring_soon` 窗口内仍有积分到期的账号在选号时**硬优先**（按最近到期时间升序，同时间剩余积分多者优先），其余路径的权重按快过期占比线性放大（1-3 倍） |
+| `pool.expiring_soon` | `168h` | 快过期路由窗口：仅此窗口内的批次参与最早到期优先与权重放大；留空或 `0` 关闭 |
 | `session_sticky.enabled` | `true` | 会话粘性路由开关 |
 | `session_sticky.ttl` | `30m` | 会话绑定 TTL（滚动续期） |
 | `session_sticky.gc_interval` | `5m` | 过期绑定 GC 周期 |
@@ -477,11 +477,12 @@ curl -s http://localhost:7863/v1/chat/completions \
 
 1. 过滤：禁用 / 冷却 / 熔断 / 在途占满账号不参与
 2. 按模型实测成本分层，只保留当前最优层
-3. 默认开启最早到期优先：
+3. 默认开启最早到期优先（issue #101 口径，文档与实现同步）：
 
-   - 在模型成本最优层内，筛选 `expiring_soon` 窗口内仍有积分的账号。
-   - 按最近到期时间升序排序；同到期时间按该批次剩余积分降序。
+   - 在模型成本最优层内，筛选 `expiring_soon` 窗口内仍有积分的账号进入**优先集**（硬优先，不再落入普通加权随机）。
+   - 优先集内按最近到期时间升序排序；同到期时间按该批次剩余积分降序。
    - 已过期、零余额、无有效到期时间的账号不进入优先集。
+   - 无窗口内批次（或 `prefer_expiring=false`）时，普通加权随机与粘性绑定的权重按快过期占比放大：新会话权重 ×(1 + 2 × 快过期占比) ∈ [1,3]，粘性候选槽位量化为 1-3 档——占比越高越容易被选中，金额敏感且无跳变。
 4. 优先集为空时退回普通加权随机：
 
    `weight = credits 比例 ×10 + idleWeight`

@@ -43,6 +43,11 @@ type Auth struct {
 	// 手写扁平形 auth 文件可直接写 "device_token": "..."；插件 OAuth 嵌套形
 	// 顶层 device_token 也会被解析（与桌面端共用状态文件的部署方式）。
 	DeviceToken string
+
+	// ProxyURL 本账号独立出口代理（http/https/socks5），来源 auth 文件顶层 proxy_url 键。
+	// 空 = 不指定（回落全局兜底，再回落直连）。由面板代理池指派或手写文件；写回与
+	// DeviceToken 同策略：非空才落盘，旧文件不引入空键。
+	ProxyURL string
 }
 
 // Lock 供同进程内其他包（upstream.RefreshToken）在改写 Auth 字段期间加锁。
@@ -89,6 +94,30 @@ func (a *Auth) RefreshTokenValue() string {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	return a.RefreshToken
+}
+
+// ProxyURLValue 加锁读取账号级出口代理。写方是面板 SetProxyURL（a.mu 内改写），
+// 读方是 upstream.clientFor 出站选路——与 token 字段同一并发口径。
+func (a *Auth) ProxyURLValue() string {
+	if a == nil {
+		return ""
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.ProxyURL
+}
+
+// SetProxyURL 加锁写回账号级出口代理（空串 = 清除，回落全局兜底/直连）。
+// 返回是否有变更；调用方负责 SaveAtomic 落盘。
+func (a *Auth) SetProxyURL(url string) bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	url = strings.TrimSpace(url)
+	if a.ProxyURL == url {
+		return false
+	}
+	a.ProxyURL = url
+	return true
 }
 
 // globalEnabled 全局开关：global realm 是否路由（D5 双保险）。
@@ -236,6 +265,8 @@ func Parse(raw []byte) (*Auth, error) {
 			} `json:"account"`
 			// DeviceToken 顶层 device_token（嵌套形与扁平形共用；手写时无需嵌进 auth 对象）。
 			DeviceToken string `json:"device_token"`
+			// ProxyURL 顶层 proxy_url（与 DeviceToken 同层：账号级出口代理）。
+			ProxyURL string `json:"proxy_url"`
 		}
 		if err := json.Unmarshal(raw, &n); err != nil {
 			return nil, fmt.Errorf("storage_parse_error: %w", err)
@@ -250,6 +281,7 @@ func Parse(raw []byte) (*Auth, error) {
 			EnterpriseID: n.Account.EnterpriseID,
 			Nickname:     n.Account.Nickname,
 			DeviceToken:  n.DeviceToken,
+			ProxyURL:     n.ProxyURL,
 		}
 	} else {
 		var f struct {
@@ -262,6 +294,7 @@ func Parse(raw []byte) (*Auth, error) {
 			EnterpriseID string `json:"enterpriseId"`
 			Nickname     string `json:"nickname"`
 			DeviceToken  string `json:"device_token"`
+			ProxyURL     string `json:"proxy_url"`
 		}
 		if err := json.Unmarshal(raw, &f); err != nil {
 			return nil, fmt.Errorf("storage_parse_error: %w", err)
@@ -276,6 +309,7 @@ func Parse(raw []byte) (*Auth, error) {
 			EnterpriseID: f.EnterpriseID,
 			Nickname:     f.Nickname,
 			DeviceToken:  f.DeviceToken,
+			ProxyURL:     f.ProxyURL,
 		}
 	}
 	if strings.TrimSpace(a.AccessToken) == "" {
@@ -314,6 +348,10 @@ func (a *Auth) SaveAtomic() error {
 	// （保持与插件 OAuth 输出形状一致，插件读取忽略未知键）。
 	if a.DeviceToken != "" {
 		doc["device_token"] = a.DeviceToken
+	}
+	// ProxyURL 同策略：非空才写顶层 proxy_url（账号级出口代理，面板代理池指派）。
+	if a.ProxyURL != "" {
+		doc["proxy_url"] = a.ProxyURL
 	}
 	raw, err := json.MarshalIndent(doc, "", "  ")
 	if err != nil {

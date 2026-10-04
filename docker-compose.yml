@@ -8,7 +8,7 @@
 # 或在本级创建 .env。默认 user 已固定为 10001:10001。
 services:
   workbuddy2api:
-    image: ghcr.io/aibyhub/workbuddy2api-panel:1.11.10-panel
+    image: ghcr.io/aibyhub/workbuddy2api-panel:1.11.12-panel
     container_name: workbuddy2api-panel
     restart: unless-stopped
     mem_limit: 512m

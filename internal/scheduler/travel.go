@@ -58,10 +58,14 @@ func (s *Scheduler) RunTravelNow() {
 			continue // D4 门控：global 无 CN 任务体系，不发起任何上游调用
 		}
 		if !first {
-			time.Sleep(travelAccountDelay)
+			if !sleepCtx(s.baseCtx(), travelAccountDelay) {
+				return // 优雅停机：剩余账号下轮再巡
+			}
 		}
 		first = false
-		s.travelOne(a)
+		runAccountBounded("travel "+logfmt.Label(st.UID, st.Nickname), func() {
+			s.travelOne(a)
+		})
 	}
 }
 

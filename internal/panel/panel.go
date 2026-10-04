@@ -40,6 +40,8 @@ type Config struct {
 	APIKey    string               // 空 = 不鉴权（与主服务同语义）；与 Live 同时给出时 Live 优先
 	RedisMode string               // "upstash" / "noop"，仅观测透出
 	Version   string               // 面板版本号（展示用）
+	// Proxies 代理池（nil = 代理池接口返回 501；data/proxies.json 持久化）。
+	Proxies *ProxyPool
 
 	// Live 运行期可变配置（在线改配置立即生效）。
 	Live *livecfg.Holder
@@ -90,6 +92,11 @@ type Panel struct {
 	// 任务中心执行队列（taskcenter.go）。
 	queueOnce sync.Once
 	q         *queueState
+
+	// familyMu/familyLocks 批量任务族级互斥（checkin_all 等手动触发与排程防重叠），
+	// 见 spawnFamilyBatch。
+	familyMu    sync.Mutex
+	familyLocks map[string]*sync.Mutex
 }
 
 // tryLockAccount 尝试锁定账号的任务执行；已在执行返回 false。
@@ -184,6 +191,17 @@ func (p *Panel) routes() {
 	p.mux.HandleFunc("GET /panel/api/model_probes", p.withAuth(p.modelProbes))
 	p.mux.HandleFunc("GET /panel/api/config", p.withAuth(p.getConfig))
 	p.mux.HandleFunc("POST /panel/api/config", p.withAuth(p.saveConfig))
+	// 代理池：池 CRUD + 批量导入 + 测速；账号级出口指派与实测。
+	p.mux.HandleFunc("GET /panel/api/proxies", p.withAuth(p.proxiesGet))
+	p.mux.HandleFunc("POST /panel/api/proxies", p.withAuth(p.proxiesAdd))
+	p.mux.HandleFunc("POST /panel/api/proxies/bulk", p.withAuth(p.proxiesBulkAdd))
+	p.mux.HandleFunc("POST /panel/api/proxies/test_all", p.withAuth(p.proxiesTestAll))
+	p.mux.HandleFunc("POST /panel/api/proxies/{name}/test", p.withAuth(p.proxiesTest))
+	p.mux.HandleFunc("GET /panel/api/proxies/{name}/url", p.withAuth(p.proxiesURLGet))
+	p.mux.HandleFunc("POST /panel/api/proxies/{name}", p.withAuth(p.proxiesUpdate))
+	p.mux.HandleFunc("DELETE /panel/api/proxies/{name}", p.withAuth(p.proxiesDelete))
+	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/proxy", p.withAuth(p.accountProxySet))
+	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/proxy_test", p.withAuth(p.accountProxyTest))
 }
 
 // ServeHTTP 统一入口：先写安全响应头再分发，保证页面、静态资源、API
@@ -227,11 +245,33 @@ func (p *Panel) expiringSoonWindow() time.Duration {
 // ---------------------------------------------------------------------------
 
 // overview 总览：池计数 + 每账号状态 + 面板元信息。
+// 账号行附加出口代理字段（proxy=脱敏地址 / proxy_name=池内名称），前端账号表
+// 「出口」列与代理池视图共用同一份数据源。
 func (p *Panel) overview(w http.ResponseWriter, r *http.Request) {
 	total, healthy, cooling, disabled, inFlightFull := p.cfg.Pool.CountsDetailed()
 	sticky := 0
 	if p.cfg.StickyCount != nil {
 		sticky = p.cfg.StickyCount()
+	}
+	type accountRow struct {
+		pool.Status
+		Proxy     string `json:"proxy,omitempty"`      // 脱敏出口地址（空 = 直连/全局兜底）
+		ProxyName string `json:"proxy_name,omitempty"` // 池内名称（便于人读）
+	}
+	sts := p.cfg.Pool.List()
+	rows := make([]accountRow, 0, len(sts))
+	for _, st := range sts {
+		row := accountRow{Status: st}
+		if a := p.cfg.Pool.AuthByUID(st.UID); a != nil {
+			raw := strings.TrimSpace(a.ProxyURLValue())
+			if raw != "" {
+				row.Proxy = maskProxy(raw)
+				if p.cfg.Proxies != nil {
+					row.ProxyName = p.cfg.Proxies.NameFor(raw)
+				}
+			}
+		}
+		rows = append(rows, row)
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"version":         p.cfg.Version,
@@ -244,7 +284,7 @@ func (p *Panel) overview(w http.ResponseWriter, r *http.Request) {
 		"cooling":         cooling,
 		"disabled":        disabled,
 		"in_flight_full":  inFlightFull,
-		"accounts":        p.cfg.Pool.List(),
+		"accounts":        rows,
 	})
 }
 
@@ -558,14 +598,62 @@ func (p *Panel) accountRemove(w http.ResponseWriter, r *http.Request) {
 // 批量任务
 // ---------------------------------------------------------------------------
 
+// familyBusy 任务族级互斥：手动批量触发与小时排程、多次连点之间互斥——同一任务族
+// 同时只跑一条，重复触发直接 409「仍在执行」而不是并发跑两遍重复打上游（签到/
+// 旅行/活跃/保活的任务动作幂等，但风控暴露面随请求量线性放大）。key = 任务族名。
+// 锁条目常驻（任务族个数有限）。与任务中心的 per-account TryLock 分层互补。
+func (p *Panel) tryFamilyLock(family string) bool {
+	p.familyMu.Lock()
+	defer p.familyMu.Unlock()
+	if p.familyLocks == nil {
+		p.familyLocks = map[string]*sync.Mutex{}
+	}
+	mu := p.familyLocks[family]
+	if mu == nil {
+		mu = &sync.Mutex{}
+		p.familyLocks[family] = mu
+	}
+	return mu.TryLock()
+}
+
+func (p *Panel) unlockFamily(family string) {
+	p.familyMu.Lock()
+	mu := p.familyLocks[family]
+	p.familyMu.Unlock()
+	if mu != nil {
+		mu.Unlock()
+	}
+}
+
+// spawnFamilyBatch TryLock 成功后在独立 goroutine 执行批量任务（panic recover +
+// 解锁兜底）；已在执行返回 false（调用方回 409）。
+func (p *Panel) spawnFamilyBatch(family, label string, fn func()) bool {
+	if !p.tryFamilyLock(family) {
+		return false
+	}
+	go func() {
+		defer p.unlockFamily(family)
+		defer func() {
+			if r := recover(); r != nil {
+				log.Printf("WARN: [panel] %s panic recovered: %v", label, r)
+			}
+		}()
+		fn()
+	}()
+	return true
+}
+
 // checkinAll 手动触发全量签到（异步执行，进度看日志区/账号状态变化）。
 func (p *Panel) checkinAll(w http.ResponseWriter, r *http.Request) {
 	if p.cfg.Scheduler == nil {
 		writeErr(w, http.StatusNotImplemented, "scheduler not available")
 		return
 	}
-	go p.cfg.Scheduler.RunCheckinNow()
-	log.Printf("panel: 手动全量签到已触发（含猫猫旅行）")
+	if !p.spawnFamilyBatch("checkin", "手动全量签到", p.cfg.Scheduler.RunCheckinNow) {
+		writeErr(w, http.StatusConflict, "签到任务仍在执行，请稍后再试")
+		return
+	}
+	log.Printf("panel: 手动全量签到已触发（含连登管家）")
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "started": true})
 }
 
@@ -575,7 +663,10 @@ func (p *Panel) travelAll(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusNotImplemented, "scheduler not available")
 		return
 	}
-	go p.cfg.Scheduler.RunTravelNow()
+	if !p.spawnFamilyBatch("travel", "手动全量旅行", p.cfg.Scheduler.RunTravelNow) {
+		writeErr(w, http.StatusConflict, "旅行巡检仍在执行，请稍后再试")
+		return
+	}
 	log.Printf("panel: 手动全量旅行巡检已触发")
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "started": true})
 }
@@ -586,7 +677,10 @@ func (p *Panel) activityAll(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusNotImplemented, "scheduler not available")
 		return
 	}
-	go p.cfg.Scheduler.RunActivityNow()
+	if !p.spawnFamilyBatch("activity", "手动全量活跃", p.cfg.Scheduler.RunActivityNow) {
+		writeErr(w, http.StatusConflict, "活跃上报仍在执行，请稍后再试")
+		return
+	}
 	log.Printf("panel: 手动全量活跃上报已触发")
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "started": true})
 }
@@ -597,7 +691,10 @@ func (p *Panel) keepaliveAll(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusNotImplemented, "scheduler not available")
 		return
 	}
-	go p.cfg.Scheduler.RunKeepaliveNow()
+	if !p.spawnFamilyBatch("keepalive", "手动全量保活", p.cfg.Scheduler.RunKeepaliveNow) {
+		writeErr(w, http.StatusConflict, "保活任务仍在执行，请稍后再试")
+		return
+	}
 	log.Printf("panel: 手动全量保活已触发")
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "started": true})
 }
@@ -639,11 +736,11 @@ func (p *Panel) syncNicknames() {
 		return
 	}
 	var (
-		mu       sync.Mutex
-		updated  int
-		failed   int
-		sem      = make(chan struct{}, 3)
-		wg       sync.WaitGroup
+		mu      sync.Mutex
+		updated int
+		failed  int
+		sem     = make(chan struct{}, 3)
+		wg      sync.WaitGroup
 	)
 	for _, j := range jobs {
 		wg.Add(1)

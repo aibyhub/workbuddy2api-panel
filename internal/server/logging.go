@@ -209,7 +209,8 @@ func (s *chatStatsReader) parseSSELine(line string) {
 }
 
 // CacheTokens 返回末帧 usage 的缓存命中 / 未命中 token 数。miss 缺失时按
-// prompt - hit 推导；hit 与 miss 均不可得时 ok=false（不参与命中率统计）。
+// prompt - hit 推导；miss 推导不出（缺 prompt 或 prompt<hit 不可信）时整体
+// ok=false 排除出命中率统计——不产出 (hit,0) 假 100% 样本（宁可少记不虚记）。
 func (s *chatStatsReader) CacheTokens() (hit, miss int64, ok bool) {
 	if !s.hasCacheHit {
 		return 0, 0, false
@@ -218,7 +219,7 @@ func (s *chatStatsReader) CacheTokens() (hit, miss int64, ok bool) {
 	miss = int64(s.cacheMiss)
 	if !s.hasCacheMiss {
 		if !s.hasPromptTokens || s.promptTokens < s.cacheHit {
-			return hit, 0, true
+			return 0, 0, false
 		}
 		miss = int64(s.promptTokens - s.cacheHit)
 	}

@@ -616,6 +616,12 @@ type Client struct {
 	// IdleTimeout 聊天 SSE 流中空闲超时；<=0 表示禁用空闲监控。
 	IdleTimeout time.Duration
 
+	// proxyClients 按代理 URL 缓存的客户端对（std/stream），支撑每账号独立出口
+	//（见 proxy.go clientFor：auth proxy_url > 全局兜底 > 直连）。
+	proxyClients sync.Map // string → *proxyPair
+	// globalProxy 全局兜底代理（atomic string，面板热改即时生效；空 = 未设置）。
+	globalProxy atomic.Value
+
 	// effortsMu/efforts 缓存各模型 supportedEfforts（FetchModels 刷新），供请求体 effort 降级。
 	// 按 realm 分层桶（cn/global）：同模型名跨域探测的 effort 集合可能不同，
 	// 混桶会互相污染（C-2）。
@@ -688,11 +694,11 @@ type Client struct {
 func New() *Client {
 	tr := newTransport()
 	c := &Client{
-		HTTP:         &http.Client{Timeout: 120 * time.Second, Transport: tr},
-		ChatHTTP:     &http.Client{Timeout: 0, Transport: tr}, // 无总时长；首字节由 ResponseHeaderTimeout 管
-		ChatBaseCN:   "https://copilot.tencent.com",
+		HTTP:          &http.Client{Timeout: 120 * time.Second, Transport: tr},
+		ChatHTTP:      &http.Client{Timeout: 0, Transport: tr}, // 无总时长；首字节由 ResponseHeaderTimeout 管
+		ChatBaseCN:    "https://copilot.tencent.com",
 		BillingBaseCN: "https://www.codebuddy.cn",
-		WebBaseCN:    "https://www.workbuddy.cn",
+		WebBaseCN:     "https://www.workbuddy.cn",
 		// GlobalEnabled 缺省 true（与 config global.enabled 缺省 true 一致；纯 CN 部署行为不变：
 		// CN 账号恒判 cn，global base 只在 realm=global 的账号上被使用）。
 		GlobalEnabled: true,
@@ -859,8 +865,10 @@ func (c *Client) webBase(a *auth.Auth) string {
 // doJSON 发请求并解信封；HTTP 非 2xx 或业务 code != 0 时返回带 body 片段的 *Error。
 // body 读失败（连接中断/空闲掐流/截断）返回普通错误（非 *Error）——半截 body 不进
 // Classify，不参与账号惩罚（传输层故障不该喂熔断误罚号）。
-func (c *Client) doJSON(req *http.Request) (json.RawMessage, error) {
-	resp, err := c.HTTP.Do(req)
+// 出口按账号独立代理（clientFor(a)：auth proxy_url > 全局兜底 > 直连）。
+func (c *Client) doJSON(req *http.Request, a *auth.Auth) (json.RawMessage, error) {
+	std, _ := c.clientFor(a)
+	resp, err := std.Do(req)
 	if err != nil {
 		return nil, err
 	}
@@ -940,7 +948,7 @@ func (c *Client) RefreshToken(a *auth.Auth) error {
 	c.RefreshHeaders(req, &hdrSnapshot)
 
 	// 网络 I/O（锁外，30s 上限）。
-	data, err := c.doJSON(req)
+	data, err := c.doJSON(req, a)
 	if err != nil {
 		return err
 	}
@@ -1025,6 +1033,8 @@ func (c *Client) ChatStreamContext(ctx context.Context, a *auth.Auth, body []byt
 	// reqCtx 的 cancel 在每个出口显式调用（Do 失败 / ≥400 / 成功分支移交 monitorBody），
 	// 循环本身各分支必 return——无循环尾兜底代码（此前外层 var cancel 从未赋值 +
 	// 尾部不可达 cancel() 是潜伏 nil-panic，已删；chatPaths 恒非空由构造保证）。
+	// 出口按账号独立代理（clientFor(a) 的 stream 客户端：无总超时，SSE 语义）。
+	_, streamClient := c.clientFor(a)
 	for _, path := range c.chatPaths(a) {
 		endpoint := c.chatBase(a) + path
 		req, err := http.NewRequest(http.MethodPost, endpoint, bytes.NewReader(prepared))
@@ -1036,14 +1046,14 @@ func (c *Client) ChatStreamContext(ctx context.Context, a *auth.Auth, body []byt
 		// 同时 monitorBody.Close 仍能独立 cancel 本分支（空闲掐流）。
 		reqCtx, cancel := context.WithCancel(ctx)
 		req = req.WithContext(reqCtx)
-		resp, err := c.chatHTTP().Do(req)
+		resp, err := streamClient.Do(req)
 		if err != nil {
 			cancel()
 			log.Printf("ERR: [upstream] chat_stream acct=%s: transport error: %v", logfmt.Label(a.UID, a.Nickname), err)
 			// 传输层失败 → 清空共享连接池的空闲连接（连接层加固）：失败连接可能仍
 			// 留在空闲池里，下一个请求会继续捡到它——仅靠 IdleConnTimeout 等过期
 			// 不够，主动清池才断根。
-			roundTripCloseIdle(c.chatHTTP().Transport)
+			roundTripCloseIdle(streamClient.Transport)
 			return nil, 0, nil, err
 		}
 		if resp.StatusCode >= 400 {
@@ -1318,7 +1328,8 @@ func (c *Client) fetchEnterpriseModels(a *auth.Auth) ([]ModelInfo, error) {
 	c.CommonHeaders(req, a) // 复用共享请求头（Origin/Referer/UA/Accept/Content-Type）
 	// AccessToken 加锁快照（见 auth.AccessTokenValue：keepalive 刷新在 a.mu 内改写）。
 	req.Header.Set("Authorization", "Bearer "+a.AccessTokenValue())
-	resp, err := c.HTTP.Do(req)
+	stdClient, _ := c.clientFor(a)
+	resp, err := stdClient.Do(req)
 	if err != nil {
 		return nil, err
 	}
@@ -1672,7 +1683,8 @@ func (c *Client) fetchV3ConfigModelMap(a *auth.Auth, ua string) (map[string]Mode
 	}
 	req.Header.Set("User-Agent", ua)
 	c.injectCodeBuddyRequest(req)
-	resp, err := c.HTTP.Do(req)
+	stdClient, _ := c.clientFor(a)
+	resp, err := stdClient.Do(req)
 	if err != nil {
 		return nil, err
 	}

@@ -6,8 +6,8 @@ import (
 	"time"
 )
 
-// expiringVirtualSlots 快过期账号在新会话候选集中的虚拟实例权重。
-// 3:1 是温和偏好，不是固定比例：账号组成变化会自然改变最终占比。
+// expiringVirtualSlots 快过期账号在新会话候选集中的虚拟实例槽位上限
+// （expiringSlotsOf 量化到 [1, 本值]，占比满格即达上限）。
 const expiringVirtualSlots = 3
 
 // AvailableUIDsForRealm 同 AvailableUIDs，但仅返回 Realm()==realm 的账号。
@@ -35,9 +35,10 @@ func (p *Pool) AvailableUIDsForRealm(realm string) []string {
 
 // WeightedAvailableUIDsForModelRealm 返回带虚拟实例权重的可用账号列表。
 //
-// 普通账号出现 1 次；有效快过期账号出现 expiringVirtualSlots 次。调用方继续按
-// 原有序列表哈希，即可让新会话对快过期账号形成温和偏好。重复项按 UID 排序后
-// 展开，保证同一账号拓扑下不同进程得到一致列表。
+// 普通账号出现 1 次；有效快过期账号按快过期占比量化为 1-3 次（expiringSlotsOf，
+// issue #101：布尔 ×3 → 金额敏感的量化槽位）。调用方继续按原有序列表哈希，即可
+// 让新会话对快过期账号形成温和偏好。重复项按 UID 排序后展开，保证同一账号拓扑
+// 下不同进程得到一致列表。
 //
 // 该方法是现有 AvailableUIDsForModelRealm 的增量入口，不改变旧方法语义，也不
 // 修改配置、状态或 Redis schema。prefer_expiring=false 时退化为逐账号一次。
@@ -65,7 +66,7 @@ func (p *Pool) WeightedAvailableUIDsForModelRealm(model, realm string) []string 
 		slots := 1
 		if p.preferExpiring {
 			if e := p.byUID[uid]; expiringNow(e, now) {
-				slots = expiringVirtualSlots
+				slots = expiringSlotsOf(e)
 			}
 		}
 		for i := 0; i < slots; i++ {

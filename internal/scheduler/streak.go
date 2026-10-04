@@ -29,7 +29,9 @@ func (s *Scheduler) RunStreakBonusNow() {
 		if a.IsGlobal() {
 			continue // D4 门控：global 无 CN 任务体系，不发起任何上游调用
 		}
-		s.streakBonusAccount(a)
+		runAccountBounded("streak-bonus "+logfmt.Label(st.UID, st.Nickname), func() {
+			s.streakBonusAccount(a)
+		})
 	}
 }
 

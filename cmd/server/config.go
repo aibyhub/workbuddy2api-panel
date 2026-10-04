@@ -122,6 +122,10 @@ type Config struct {
 		DeviceTokenFile string `json:"device_token_file"`
 		// PassthroughIP 是否透传客户端 IP 给上游（默认 false，反代安全边界）。
 		PassthroughIP bool `json:"passthrough_ip"`
+		// ProxyURL 全局兜底出口代理（http/https/socks5/socks5h）。优先级：
+		// 账号 auth 文件 proxy_url > 本项 > 直连。空 = 不指定（缺省直连）。
+		// 面板保存配置热生效；非法 scheme 在传输层兜底直连并打 WARN。
+		ProxyURL string `json:"proxy_url"`
 	} `json:"upstream"`
 
 	Features struct {

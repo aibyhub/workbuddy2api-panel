@@ -3,6 +3,7 @@ package pool
 
 import (
 	"log"
+	"math"
 	"math/rand/v2"
 	"sort"
 	"strconv"
@@ -431,14 +432,50 @@ func expiringNow(e *entry, now time.Time) bool {
 		e.creditsEarliestExpiry.After(now)
 }
 
-// routingWeightOf 在普通账号权重上叠加快过期虚拟实例数量。prefer_expiring=false
-// 或账号无有效快过期批次时，实例数恒为 1，结果与旧 weightOf 完全一致。
+// routingWeightOf 在普通账号权重上叠加快过期偏好。prefer_expiring=false 或账号
+// 无有效快过期批次时与旧 weightOf 完全一致（issue #101：从「命中窗口即 ×3」的
+// 布尔权重平滑为按快过期占比线性放大——金额敏感、无跳变，且文档与实现同口径）。
 func (p *Pool) routingWeightOf(e *entry, maxCredits int64, now time.Time) float64 {
 	w := p.weightOf(e, maxCredits, now)
 	if p.preferExpiring && expiringNow(e, now) {
-		return w * expiringVirtualSlots
+		return w * expiringWeightFactor(e)
 	}
 	return w
+}
+
+// expiringWeightFactor 快过期权重因子 = 1 + 2 ×（creditsExpiring / credits），
+// ∈ [1,3]：剩余积分里快过期占比越高权重越大（占比 0 → 1×，全部快过期 → 3×，
+// 与旧布尔 ×3 的上限一致）。credits<=0 防御回 1。
+func expiringWeightFactor(e *entry) float64 {
+	if e.credits <= 0 || e.creditsExpiring <= 0 {
+		return 1
+	}
+	ratio := float64(e.creditsExpiring) / float64(e.credits)
+	if ratio > 1 {
+		ratio = 1
+	}
+	return 1 + 2*ratio
+}
+
+// expiringSlotsOf 粘性候选集的虚拟槽位数 = 1 + round(2 × 快过期占比)，量化到
+// [1, expiringVirtualSlots]：占比越高新会话越容易绑到该号，但保持整数槽位——
+// 粘性绑定靠「对固定列表哈希」，连续权重会破坏同拓扑下的确定性列表。
+func expiringSlotsOf(e *entry) int {
+	if e.credits <= 0 || e.creditsExpiring <= 0 {
+		return 1
+	}
+	ratio := float64(e.creditsExpiring) / float64(e.credits)
+	if ratio > 1 {
+		ratio = 1
+	}
+	s := 1 + int(math.Round(2*ratio))
+	if s < 1 {
+		s = 1
+	}
+	if s > expiringVirtualSlots {
+		s = expiringVirtualSlots
+	}
+	return s
 }
 
 // SetCredits 更新账号余额。

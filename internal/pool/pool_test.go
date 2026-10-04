@@ -1799,8 +1799,9 @@ func TestPreferExpiringDisabledRestoresWeight(t *testing.T) {
 	we := p.routingWeightOf(p.byUID["a"], 100, now)
 	wn := p.routingWeightOf(p.byUID["b"], 100, now)
 	p.mu.Unlock()
-	if we != wn*expiringVirtualSlots {
-		t.Fatalf("enabled expiring weight=%v want %v", we, wn*expiringVirtualSlots)
+	// issue #101 权重平滑：a 的快过期占比 50% → ×2（旧布尔语义恒 ×3，已随实现更新）。
+	if we != wn*2 {
+		t.Fatalf("enabled expiring weight=%v want %v", we, wn*2)
 	}
 
 	p.SetPreferExpiring(false)

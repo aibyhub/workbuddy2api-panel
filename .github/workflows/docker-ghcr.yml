@@ -112,7 +112,10 @@ jobs:
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           tags: |
-            type=raw,value=${{ steps.version.outputs.version }}
+            # 源码版本 tag（如 1.11.12-panel）只在 v* 发版 tag 推送时发布——main 每次
+            # push 都覆盖同名 tag 会让「compose 固定版本号」失去可复现性（同 tag 不同
+            # digest，回滚时拿到的已不是当时的镜像）。main push 用 sha-/main/latest。
+            type=raw,value=${{ steps.version.outputs.version }},enable=${{ startsWith(github.ref, 'refs/tags/v') }}
             type=raw,value=latest,enable={{is_default_branch}}
             type=ref,event=branch
             type=semver,pattern={{version}}

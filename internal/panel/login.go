@@ -240,6 +240,9 @@ func (p *Panel) loginPoll(w http.ResponseWriter, r *http.Request) {
 	}
 	p.cfg.Pool.Add(a)
 	p.cfg.Pool.Revive(acct.UID) // 全新登录 = 人工恢复口径：清掉旧号遗留的禁用/冷却/熔断
+	// 新账号自动均衡指派出口代理：从池内挑被占用最少且启用的地址（trae2api-web
+	// pickImportProxy 同款）。池空或地址为空不动作；落盘失败不影响登录结果。
+	p.autoAssignProxy(a)
 
 	// 顺带签到 + 余额刷新（幂等；失败不影响登录结果，只体现在返回字段里）。
 	// realm 分支：CN 走 DailyCheckin；global 无 CN 签到体系，改为注册激活 + trial 领取

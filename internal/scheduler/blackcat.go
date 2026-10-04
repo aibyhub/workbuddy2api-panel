@@ -28,20 +28,24 @@ func (s *Scheduler) RunBlackcatNow() {
 		if a.IsGlobal() {
 			continue // D4 门控：global 无 CN 任务体系，不发起任何上游调用
 		}
-		need, err := s.cfg.Upstream.BlackcatNeed(a)
-		if err != nil {
-			log.Printf("blackcat %s: %v", logfmt.Label(a.UID, a.Nickname), err)
-			continue
+		runAccountBounded("blackcat "+logfmt.Label(st.UID, st.Nickname), func() {
+			need, err := s.cfg.Upstream.BlackcatNeed(a)
+			if err != nil {
+				log.Printf("blackcat %s: %v", logfmt.Label(a.UID, a.Nickname), err)
+				return
+			}
+			if need <= 0 {
+				return
+			}
+			ok, err := s.cfg.Upstream.RunNightChats(a, int(need))
+			if err != nil {
+				log.Printf("blackcat %s: %d/%d 完成，中断: %v", logfmt.Label(a.UID, a.Nickname), ok, need, err)
+				return
+			}
+			log.Printf("blackcat %s: 完成 %d 次夜间对话", logfmt.Label(a.UID, a.Nickname), ok)
+		})
+		if !sleepCtx(s.baseCtx(), activityAccountDelay) {
+			return // 优雅停机：剩余账号下轮再补
 		}
-		if need <= 0 {
-			continue
-		}
-		ok, err := s.cfg.Upstream.RunNightChats(a, int(need))
-		if err != nil {
-			log.Printf("blackcat %s: %d/%d 完成，中断: %v", logfmt.Label(a.UID, a.Nickname), ok, need, err)
-			continue
-		}
-		log.Printf("blackcat %s: 完成 %d 次夜间对话", logfmt.Label(a.UID, a.Nickname), ok)
-		time.Sleep(activityAccountDelay)
 	}
 }

@@ -262,6 +262,8 @@ label.fld > .hint { display: block; font-size: 11.5px; color: var(--ink-3); marg
 .cred { min-width: 84px; }
 .cred .n { font-family: var(--mono); font-variant-numeric: tabular-nums; font-size: 13px; white-space: nowrap; }
 .cred .n .of { color: var(--ink-3); font-size: 11px; }
+.cred.expiring .n .of { color: var(--warn); font-weight: 600; }
+.cred.expiring { box-shadow: inset 3px 0 0 var(--warn); }
 .bar { height: 3px; background: var(--line); border-radius: 2px; margin-top: 5px; overflow: hidden; max-width: 88px; }
 .bar i { display: block; height: 100%; background: var(--accent); border-radius: 2px; }
 .tag {
@@ -591,6 +593,9 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
       <li><a href="#packages" data-view="packages">
         <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M2.2 5.4 8 2.5l5.8 2.9v5.2L8 13.5l-5.8-2.9z"/><path d="M2.2 5.4 8 8.3l5.8-2.9M8 8.3v5.2"/></svg>
         积分构成</a></li>
+      <li><a href="#proxies" data-view="proxies">
+        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><circle cx="4" cy="4" r="1.8"/><circle cx="12" cy="4" r="1.8"/><circle cx="8" cy="12" r="1.8"/><path d="M5.3 5.3 7 10.5M10.7 5.3 9 10.5M5.8 4h4.4"/></svg>
+        代理池</a></li>
       <li><a href="#taskscenter" data-view="taskscenter">
         <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M3 2.5h10v9H8l-3 3v-3H3z"/><path d="M6 6.5h4M6 9h2.5"/></svg>
         任务中心</a></li>
@@ -648,11 +653,41 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
         <table class="acc">
           <thead><tr>
             <th class="mark" aria-hidden="true"></th>
-            <th>账号</th><th>状态</th><th>积分</th>
+            <th>账号</th><th>状态</th><th>积分</th><th>出口</th>
             <th>成功 / 失败</th><th>在途</th><th>用量</th><th>最近成功</th><th class="c-acts"></th>
           </tr></thead>
           <tbody id="accBody"></tbody>
         </table>
+        </div>
+      </div>
+    </section>
+
+    <!-- 代理池 -->
+    <section class="view" id="view-proxies" hidden>
+      <div class="box">
+        <header>
+          <h3>代理池</h3>
+          <span class="grow"></span>
+          <span class="note" id="proxyNote"></span>
+          <button class="xs" id="btnProxyBulk">批量导入</button>
+          <button class="xs" id="btnProxyTestAll">全部检测</button>
+        </header>
+        <div class="body" style="padding:10px 14px 0">
+          <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+            <input id="proxyNameIn" placeholder="名称（如 do-sg）" style="width:160px" />
+            <input id="proxyUrlIn" placeholder="socks5://user:pass@1.2.3.4:1080 或 http://host:port" style="flex:1;min-width:260px" />
+            <button class="xs primary" id="btnProxyAdd">添加</button>
+          </div>
+          <div class="hint" style="margin:6px 0 10px">账号在「账号池 → 出口」按名称指派；新账号登录后自动分配占用最少的启用代理。支持 http/https/socks5/socks5h。</div>
+        </div>
+        <div class="tbl-wrap">
+          <table class="acc">
+            <thead><tr>
+              <th class="mark" aria-hidden="true"></th>
+              <th>名称</th><th>地址</th><th>状态</th><th>账号数</th><th>出口 IP</th><th>延迟</th><th>最近检测</th><th class="c-acts"></th>
+            </tr></thead>
+            <tbody id="proxyBody"></tbody>
+          </table>
         </div>
       </div>
     </section>
@@ -963,7 +998,7 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
                 <span class="hint">余额低于此值不再接实测收费模型（保住免费模型可用）；0 关闭</span></label>
               <label class="fld"><span class="lb">快过期路由窗口</span>
                 <input name="expiring_soon" placeholder="168h">
-                <span class="hint">窗口内按最早到期优先；0 关闭</span></label>
+                <span class="hint">窗口内账号选号硬优先（最早到期升序）；权重随快过期占比放大 1-3 倍；0 关闭</span></label>
               <label class="fld"><span class="lb">会话粘性 TTL</span>
                 <input name="ttl" placeholder="30m">
                 <span class="hint">改动需重启进程</span></label>
@@ -992,6 +1027,9 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
               <label class="fld"><span class="lb">出站 User-Agent</span>
                 <input name="user_agent" placeholder="留空 = CLI/2.63.2 CodeBuddy/2.63.2">
                 <span class="hint">影响官网积分记录「使用端」显示；需重启</span></label>
+              <label class="fld"><span class="lb">全局兜底代理</span>
+                <input name="proxy_url" placeholder="socks5://user:pass@host:port（留空 = 直连）">
+                <span class="hint">账号未指派出口时使用（auth proxy_url 优先）；热生效</span></label>
             </div>
             <div class="hr"></div>
             <div class="grid2">
@@ -1116,6 +1154,49 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
       <button id="btnTaskAutoAll" class="primary">一键完成可自动任务</button>
       <button id="btnTaskReload">重新查询</button>
       <button id="btnCloseTask">关闭</button>
+    </footer>
+  </div>
+</div>
+
+<!-- 出口指派（账号级代理） -->
+<div class="veil" id="proxyVeil">
+  <div class="dlg" style="width:520px">
+    <header>
+      <h3>出口代理 <span class="hint" id="pxWho"></span></h3>
+      <div class="hint">选池内条目，或填自定义地址（http/https/socks5/socks5h）；清空 = 回落全局兜底/直连。保存后该账号全部上游请求走此出口。</div>
+    </header>
+    <div class="body">
+      <div style="display:flex;flex-direction:column;gap:10px">
+        <select id="pxSelect" style="width:100%"></select>
+        <input id="pxCustom" placeholder="自定义地址（留空 = 使用上方选择）" style="width:100%" />
+        <div class="hint" id="pxTestOut"></div>
+      </div>
+    </div>
+    <footer>
+      <button id="btnPxTest">测试当前选择</button>
+      <button id="btnPxClear">清空（直连）</button>
+      <span class="grow"></span>
+      <button id="btnPxSave" class="primary">保存</button>
+      <button id="btnPxClose">关闭</button>
+    </footer>
+  </div>
+</div>
+
+<!-- 批量导入代理 -->
+<div class="veil" id="proxyBulkVeil">
+  <div class="dlg" style="width:560px">
+    <header>
+      <h3>批量导入代理</h3>
+      <div class="hint">每行一条：`名称 地址` / `名称,地址` / `名称=地址`，或只写地址自动命名；# 开头为注释。</div>
+    </header>
+    <div class="body">
+      <textarea id="pxBulkText" rows="8" style="width:100%" placeholder="do-sg socks5://user:pass@10.0.0.1:10529&#10;hk-1 http://1.2.3.4:8080"></textarea>
+      <div class="hint" id="pxBulkOut" style="margin-top:8px"></div>
+    </div>
+    <footer>
+      <span class="grow"></span>
+      <button id="btnPxBulkRun" class="primary">导入</button>
+      <button id="btnPxBulkClose">关闭</button>
     </footer>
   </div>
 </div>

@@ -257,12 +257,19 @@ func Aggregate(r io.Reader) (map[string]any, error) {
 			},
 		},
 	}
+	// OpenAI 非流式响应恒含 usage（严格 schema 的客户端按必填解析）；上游整流
+	// 都没发时补零值对象，与流式路径「usage 缺失 → null 兜底」口径拉齐。
 	if usage != nil {
 		// OpenAI 非流式 usage 必含 total_tokens。上游若只发 prompt_tokens +
 		// completion_tokens（部分上游末帧缺 total），网关合成补齐——否则严格按
 		// schema 校验的客户端收不到 total_tokens。已有 total 或二者缺一不补
 		// （不臆造：单边有值无法合成可信的 total）。
 		resp["usage"] = normalizeUsageCacheAliases(ensureUsageTotal(usage))
+	} else {
+		// 数值用 float64 与「上游 JSON 解码后的形态」一致，消费方类型断言不分裂。
+		resp["usage"] = normalizeUsageCacheAliases(map[string]any{
+			"prompt_tokens": float64(0), "completion_tokens": float64(0), "total_tokens": float64(0),
+		})
 	}
 	return resp, nil
 }
