@@ -126,6 +126,11 @@ type Config struct {
 		// 账号 auth 文件 proxy_url > 本项 > 直连。空 = 不指定（缺省直连）。
 		// 面板保存配置热生效；非法 scheme 在传输层兜底直连并打 WARN。
 		ProxyURL string `json:"proxy_url"`
+		// TLSFingerprint 出站 TLS 指纹复刻开关（默认 true）。开启后所有出站
+		// （直连 + 代理出口）的 ClientHello 复刻真实 WorkBuddy 桌面端 Node 形态
+		// （internal/tlsfp，参数为 2026-10-02 真机抓包字节级实测），消除 Go 栈
+		// JA3/JA4 可识别性。false 即回退标准 Go 传输（历史行为），改后重启生效。
+		TLSFingerprint *bool `json:"tls_fingerprint"`
 	} `json:"upstream"`
 
 	Features struct {

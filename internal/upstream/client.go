@@ -643,6 +643,12 @@ type Client struct {
 	// 面板保存配置热改 + chat 热路径并发读写，用 atomic.Bool 消除数据竞争。
 	SanitizeFingerprints atomic.Bool
 
+	// tlsFP 出站 TLS 指纹复刻开关（internal/tlsfp：复刻真实 WorkBuddy 客户端
+	// Node 形态，消除 Go 栈 JA3 可识别性）。启动期 main 按 config 设置一次；
+	// 开启会重建直连 transport 并清空代理客户端缓存，此后 clientFor 构建的
+	// 代理出口同样带指纹（见 transport.go EnableTLSFingerprint）。
+	tlsFP atomic.Bool
+
 	// UserAgent 出站 User-Agent 显式覆盖（非空时全路径生效，优先于默认三段式）。
 	// 空 = 默认官方形态：chat/refresh/FetchModels 走
 	// `WorkBuddy/<ver> WorkBuddy/<ver> CLI/<cliVer>`；billing 走 `WorkBuddy/<ver>`

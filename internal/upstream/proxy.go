@@ -43,12 +43,30 @@ func (c *Client) clientFor(a *auth.Auth) (std, stream *http.Client) {
 		c.proxyClients.Store(proxy, p)
 		return p.std, p.stream
 	}
+	if c.tlsFP.Load() {
+		// TLS 指纹模式：代理隧道由 tlsfp 拨号器内部建立（Proxy 置 nil，标准库
+		// 只对非代理 https 调 DialTLSContext），出口端呈现真实客户端指纹。
+		ftr, err := newTransportWithFingerprint(u)
+		if err == nil {
+			p := &proxyPair{
+				std:    &http.Client{Timeout: std.Timeout, Transport: ftr},
+				stream: &http.Client{Transport: ftr}, // 无总超时（SSE）
+			}
+			c.proxyClients.Store(proxy, p)
+			return p.std, p.stream
+		}
+		// 仅 https 代理走到这里：回退标准代理路径，日志留证。
+		log.Printf("tlsfp: proxy %q unsupported (%v) — fallback to standard transport (no fingerprint)", proxy, err)
+	}
 	var tr *http.Transport
 	if base, ok := std.Transport.(*http.Transport); ok && base != nil {
 		tr = base.Clone() // 复制连接层加固参数（Clone 不复制既有连接），再覆盖代理
 	} else {
 		tr = &http.Transport{}
 	}
+	// Clone 会连 DialTLSContext 一起复制；标准库对带 Proxy 的 https 不调用它，
+	// 但回退语义要求彻底还原标准路径，显式清空（Clone 不复制既有连接）。
+	tr.DialTLSContext = nil
 	tr.Proxy = http.ProxyURL(u)
 	// newTransport 已置空 TLSNextProto（真正禁 h2）；Clone 原样保留该设置，代理出口
 	// 与直连同为 HTTP/1.1，无 trae 侧 ALPN/h2 半协商问题。

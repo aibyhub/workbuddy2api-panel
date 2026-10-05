@@ -7,9 +7,14 @@ package upstream
 
 import (
 	"crypto/tls"
+	"log"
 	"net"
 	"net/http"
+	"net/url"
+	"sync"
 	"time"
+
+	"github.com/linguo2625469/workbuddy2api-panel/internal/tlsfp"
 )
 
 // 连接层参数集中定义（与 server/backoff.go 同风格：一处定义，测试可回读断言）。
@@ -91,6 +96,71 @@ func newTransport() *http.Transport {
 // http2.Transport 等均满足；测试注入的自定义 RoundTripper 可选择性实现）。
 type closeIdler interface {
 	CloseIdleConnections()
+}
+
+// newTransportWithFingerprint 构造带 TLS 指纹复刻的 Transport（直连或按代理出口）。
+// tlsfp 模式下 Proxy 必须置 nil——标准库只对非代理 https 调 DialTLSContext，代理
+// 隧道由 tlsfp 拨号器内部建立，指纹握手发生在隧道出口端；UConn 非 *tls.Conn，
+// TLSNextProto 置空禁 h2 的既有约定保持不变（Node 档本身无 ALPN，即 HTTP/1.1）。
+// base 拨号器复用 newDialer()，保留 10s 建连 + 15s keepalive 连接层加固。
+// 仅 https 代理（TLS-to-proxy 双层握手不做指纹，与 sub2api 同策略）返回错误，
+// 调用方回退标准 transport 并留日志。
+func newTransportWithFingerprint(proxyURL *url.URL) (*http.Transport, error) {
+	dial, err := tlsfp.NewDialTLSContext(newDialer(), proxyURL)
+	if err != nil {
+		return nil, err
+	}
+	tr := newTransport()
+	tr.DialTLSContext = dial
+	return tr, nil
+}
+
+// TLSFingerprintEnabled 报告 TLS 指纹复刻是否已开启。
+func (c *Client) TLSFingerprintEnabled() bool { return c.tlsFP.Load() }
+
+// EnableTLSFingerprint 开启 TLS 指纹复刻：重建直连客户端对（连接池里的旧连接
+// 是 Go 指纹握手，直接换新 Transport）并清空代理客户端缓存（clientFor 按需
+// 重建时读取 tlsFP 走指纹路径）。仅在启动装配期调用一次（main 在超时覆盖前），
+// 不做运行期热切换——热切换会让在途连接与新连接指纹不一致，反而可疑。
+// 测试注入的 mock Transport（非 *http.Transport）原样保留，不误重建。
+func (c *Client) EnableTLSFingerprint() {
+	if c.tlsFP.Swap(true) {
+		return
+	}
+	if tr, ok := c.HTTP.Transport.(*http.Transport); ok {
+		if ftr, err := newTransportWithFingerprint(nil); err == nil {
+			// 保留 main 已应用的 config 覆盖（ResponseHeaderTimeout 等导出字段）。
+			ftr.ResponseHeaderTimeout = tr.ResponseHeaderTimeout
+			c.HTTP = &http.Client{Timeout: c.HTTP.Timeout, Transport: ftr}
+			if c.ChatHTTP != nil {
+				c.ChatHTTP = &http.Client{Timeout: c.ChatHTTP.Timeout, Transport: ftr}
+			}
+		} else {
+			log.Printf("tlsfp: enable failed (%v) — keep standard transport", err)
+			c.tlsFP.Store(false)
+			return
+		}
+	}
+	c.proxyClients = sync.Map{}
+	log.Printf("tlsfingerprint: ENABLED (WorkBuddy Node form, JA3 %s)", tlsfp.WorkBuddyJA3MD5)
+}
+
+// DisableTLSFingerprint 关闭 TLS 指纹复刻并回退标准传输（重建直连对 + 清缓存）。
+// 与 Enable 对称的回退开关；启动装配期使用。
+func (c *Client) DisableTLSFingerprint() {
+	if !c.tlsFP.Swap(false) {
+		return
+	}
+	if tr, ok := c.HTTP.Transport.(*http.Transport); ok {
+		ntr := newTransport()
+		ntr.ResponseHeaderTimeout = tr.ResponseHeaderTimeout
+		c.HTTP = &http.Client{Timeout: c.HTTP.Timeout, Transport: ntr}
+		if c.ChatHTTP != nil {
+			c.ChatHTTP = &http.Client{Timeout: c.ChatHTTP.Timeout, Transport: ntr}
+		}
+	}
+	c.proxyClients = sync.Map{}
+	log.Printf("tlsfingerprint: DISABLED — standard transport")
 }
 
 // roundTripCloseIdle 在传输层请求失败后清掉 rt 所属 Transport 的空闲连接池

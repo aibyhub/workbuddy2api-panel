@@ -32,7 +32,7 @@ import (
 )
 
 // appVersion 网关版本（fork 版：面板 + 任务体系），透出到 /panel/api/overview。
-const appVersion = "1.11.16-panel"
+const appVersion = "1.11.17-panel"
 
 // usagePathFor 由 state 文件路径推出用量文件路径：同目录、文件名 usage.json。
 // 这样 config 里改 state_file 时用量数据跟着走，不需要额外配置项。
@@ -133,6 +133,16 @@ func main() {
 	}
 
 	up := upstream.New()
+
+	// TLS 指纹复刻（config upstream.tls_fingerprint，缺省 true）：在超时覆盖之前
+	// 开启——EnableTLSFingerprint 重建的 transport 会沿用已应用的覆盖字段，
+	// 其后 :146 的 ResponseHeaderTimeout 覆盖作用在新 transport 上，两序皆安全，
+	// 此处取「先指纹后覆盖」让新 transport 天然接收全部 config 覆盖。
+	if cfg.Upstream.TLSFingerprint == nil || *cfg.Upstream.TLSFingerprint {
+		up.EnableTLSFingerprint()
+	} else {
+		up.DisableTLSFingerprint()
+	}
 
 	// 积分保底的「收费」兜底判据：接上游模型目录的积分倍率表。本地实测台账无观测
 	// 时用它判收费——否则「没学过」恒等于「放行」，高价新模型会把触底号一笔打穿
