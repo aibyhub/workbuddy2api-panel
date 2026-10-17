@@ -159,7 +159,10 @@ func TestPickWeightedUniformWhenAllZero(t *testing.T) {
 
 func TestPickWeightedTopFiveOnly(t *testing.T) {
 	withNoPickGap(t)
-	// 第 6 高 credits 的账号在 Top5 之外，权重抽签永远轮不到它。
+	// Top5 截断的机械语义：冷却窗内（账号均无惩罚叠加、credits 完胜）第 6 高
+	// credits 的账号不进短名单、首轮轮不到它。注意不再断言 2000 轮永不轮到：
+	// 用量均衡层会让被高频轮用的 top5 权重衰减，闲置的 a6 终会被轮到（公平层
+	// 的设计目标，见 fairness_test.go）——本用例只验证截断本身。
 	p := New("")
 	for _, u := range []string{"a1", "a2", "a3", "a4", "a5", "a6"} {
 		p.Add(&auth.Auth{UID: u})
@@ -170,10 +173,8 @@ func TestPickWeightedTopFiveOnly(t *testing.T) {
 	p.SetCredits("a4", 1000, 0)
 	p.SetCredits("a5", 1000, 0)
 	p.SetCredits("a6", 5, 0) // Top5 之外
-	for i := 0; i < 2000; i++ {
-		if got := p.Pick(); got == nil || got.UID == "a6" {
-			t.Fatalf("iter %d: picked %+v, a6 must stay outside top-5", i, got)
-		}
+	if got := p.Pick(); got == nil || got.UID == "a6" {
+		t.Fatalf("picked %+v, a6 must stay outside top-5 on first pick", got)
 	}
 }
 
@@ -205,17 +206,45 @@ func TestPickTopFiveByIdleNotCredits(t *testing.T) {
 
 func TestPickDeterministicViaSetRandomSource(t *testing.T) {
 	withNoPickGap(t)
-	p := New("")
-	p.SetRandomSource(func(n int64) int64 { return 0 })
-	p.Add(&auth.Auth{UID: "u1"})
-	p.Add(&auth.Auth{UID: "u2"})
-	p.SetCredits("u1", 100, 0)
-	p.SetCredits("u2", 50, 0)
-	// r=0 ∈ [0,50) → 命中 u1。注入源应使选号完全确定。
+	// 注入源的"确定性"契约 = 同参数下选号序列完全可重放。负载均衡层（窗口内
+	// 被选次数降权）会随轮次改写权重，"每次都 u1" 的旧断言已不成立——公平层
+	// 会在 u1 连续被选后把流量摊给 u2（见 fairness_test.go）。此处改为：
+	// ① 同配置双开重放序列必须逐步一致；② credits 优势仍在（u1 占多数）。
+	build := func() *Pool {
+		p := New("")
+		p.SetRandomSource(func(n int64) int64 { return 0 })
+		p.Add(&auth.Auth{UID: "u1"})
+		p.Add(&auth.Auth{UID: "u2"})
+		p.SetCredits("u1", 100, 0)
+		p.SetCredits("u2", 50, 0)
+		return p
+	}
+	p1, p2 := build(), build()
+	seq1, seq2 := make([]string, 50), make([]string, 50)
 	for i := 0; i < 50; i++ {
-		if got := p.Pick(); got == nil || got.UID != "u1" {
-			t.Fatalf("iter %d: pick=%+v want u1 (deterministic)", i, got)
+		a := p1.Pick()
+		b := p2.Pick()
+		if a == nil || b == nil {
+			t.Fatalf("iter %d: pick nil (a=%v b=%v)", i, a, b)
 		}
+		seq1[i], seq2[i] = a.UID, b.UID
+		if seq1[i] != seq2[i] {
+			t.Fatalf("iter %d: 注入 r=0 后序列必须可重放，%s vs %s", i, seq1[i], seq2[i])
+		}
+	}
+	seen := map[string]bool{}
+	c1 := 0
+	for _, uid := range seq1 {
+		seen[uid] = true
+		if uid == "u1" {
+			c1++
+		}
+	}
+	if !seen["u1"] || !seen["u2"] {
+		t.Fatalf("确定性序列应覆盖两号（均衡层打散 + credits 优势共存），seq=%v", seq1)
+	}
+	if c1 <= 25 {
+		t.Fatalf("u1 (credits=100) 应占多数，got %d/50：seq=%v", c1, seq1)
 	}
 }
 

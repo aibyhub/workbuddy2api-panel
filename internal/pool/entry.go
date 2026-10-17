@@ -212,6 +212,11 @@ type entry struct {
 	// 账号 lastUsed 完全相等，基于 wall-clock 的 LRU/防惊群判定失效。
 	// usedSeq 提供严格全序，与时间精度无关。运行态，不持久化。
 	usedSeq uint64
+	// pickStamps 最近选中时间戳环（运行态，不持久化）：供 loadFairnessLocked 计算
+	// 窗口内被选次数，把权重按 1/(1+decay×count) 惩罚——「积分驱动的均衡」只看余额
+	// 看不到节奏：高余额号哪怕整小时被反复选中权重也不降，用量会持续向少数号集中
+	//（长会话粘性号不受影响：粘性命中不走 pick()，不进本环）。有界环防内存膨胀。
+	pickStamps []time.Time
 	// breakerUntil / fails / retryCount 为熔断器运行态（不持久化）。
 	// fails 是唯一的"连续失败"计数器：任何错误喂入，达到 breakerThreshold 触发熔断（指数退避），
 	// 跨入口累计，成功/熔断/统一复活时清零（保留 retryCount 驱动退避指数）。

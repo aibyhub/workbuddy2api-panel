@@ -232,6 +232,7 @@ func (p *Pool) pick(tried map[string]bool, reqModel, realm string) *auth.Auth {
 	e.lastUsed = now // 锁内即时标记：下一个进入 pick 的 goroutine 立即看到本号已用
 	p.pickSeq++
 	e.usedSeq = p.pickSeq // 单调序号：保证 usedSeq 严格全序（防惊群/LRU 的权威依据）
+	notePickLocked(e, now) // 选中打点：窗口内被选次数参与下一轮负载惩罚
 	return e.a
 }
 
@@ -336,6 +337,7 @@ func (p *Pool) pickEarliestExpiryLocked(tried map[string]bool, now time.Time, re
 	// 防集中/防惊群失效（entry.usedSeq 契约：每次被选中时取 p.pickSeq 自增值）。
 	p.pickSeq++
 	best.usedSeq = p.pickSeq
+	notePickLocked(best, now) // 兜底选中同样打点：兜底轮换也参与负载惩罚
 	return best.a
 }
 
@@ -352,6 +354,42 @@ func (p *Pool) inFlightFull(e *entry) bool {
 // minPickGap 防并发撞号窗口：同一账号在该窗口内不重复被选中（除非 top5 全部刚被用过）。
 // 生产默认 100ms；纯加权分布测试可临时置 0 关闭防撞号。
 var minPickGap = 100 * time.Millisecond
+
+// 用量均衡常量（issue 任务「多个会话启动尽量平均多个账号」）：credits 权重只看余额、
+// 看不到节奏——高余额号哪怕刚被连续选中权重也不降，流量会持续向少数号集中。本层在
+// 默认窗口内按「被选次数」平滑降权：因素子 f = 1/(1+decay×count)，count 越大权重越低
+// ，新会话自然摊向窗口内少用的号。全部为代码内定值（非配置面），粘性路径不受影响。
+const (
+	// fairnessWindow 统计窗口：最近 1 小时内的选中记录参与惩罚。
+	fairnessWindow = time.Hour
+	// fairnessCap 环容量上限：窗口内最多计入 n 次选中（防突发重试风暴把因子打到地板）。
+	fairnessCap = 16
+	// fairnessDecay 每次选中的降权系数：count=1 → ×0.8，count=4 → ×0.5，count=16 → ×0.2。
+	fairnessDecay = 0.25
+)
+
+// notePickLocked 记录一次「被选中」到时间戳环（有界），供负载均衡惩罚。须持 p.mu 写锁。
+func notePickLocked(e *entry, now time.Time) {
+	e.pickStamps = append(e.pickStamps, now)
+	if n := len(e.pickStamps); n > fairnessCap {
+		e.pickStamps = e.pickStamps[n-fairnessCap:]
+	}
+}
+
+// loadFairnessLocked 计算账号的负载惩罚因子 ∈ (0,1]：窗口内被选 count 次 →
+// 1/(1+decay×count)。顺带惰性清理窗口外的过期时间戳（调用方持 p.mu 写锁）。
+func loadFairnessLocked(e *entry, now time.Time) float64 {
+	if n := len(e.pickStamps); n > 0 {
+		cut := 0
+		for cut < n && now.Sub(e.pickStamps[cut]) > fairnessWindow {
+			cut++
+		}
+		if cut > 0 {
+			e.pickStamps = append(e.pickStamps[:0], e.pickStamps[cut:]...)
+		}
+	}
+	return 1 / (1 + fairnessDecay*float64(len(e.pickStamps)))
+}
 
 // pickWeighted 加权随机（claude-api selectWeightedRandom 参考口径）：
 //
@@ -421,6 +459,9 @@ func (p *Pool) weightOf(e *entry, maxCredits int64, now time.Time) float64 {
 	// 3.（原「成功率 ×3」因子已删，对齐上游 success-ema-review：errTotal 是终身
 	// 累计、只增不减，成功率 = successCount/(successCount+errTotal) 会让早期出过错
 	// 的号被永久压权且永不恢复；瞬时健康信号已由冷却/熔断/连败降权承接。）
+	// 4. 负载惩罚（用量均衡层）：窗口内被选越多权重越低（见 fairness* 常量），
+	//    惰性清理过期时间戳+乘法降权一步完成；未被选过的号恒 ×1。
+	w *= loadFairnessLocked(e, now)
 	return w
 }
 
