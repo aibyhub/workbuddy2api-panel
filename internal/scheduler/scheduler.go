@@ -72,6 +72,13 @@ type Scheduler struct {
 	mu         sync.Mutex
 	adoptTried map[string]string
 
+	// balanceState 后台余额刷新的连败退避状态（uid → 连败次数/跳过截止）。内存态，
+	// 进程重启即清零。同 mu 保护：与 adoptTried 都是低频写、批量读的状态。
+	// 语义见 balanceStaggerSpread / RunBalanceRefreshStaggered：上游偶发 TLS EOF 抖动
+	// 窗口内（直连实测分钟级），每 5m 全库齐刷等于把连败账号每周期再锤一次；退避让
+	// 跳过 1~2 轮，抖动自然窗外自动回池（上限 2×interval，保底不越过两个周期）。
+	balanceState map[string]balanceFailState
+
 	// schedMu 保护排程参数（时点/开关）；Reconfigure 可在运行期热改（面板保存配置时调用）。
 	// rearmSchedule/rearmBalance 是「排程已变，立即重算」通知：Run 与余额刷新循环各自消费，
 	// 分别用独立 channel（同 channel 被两个 select 消费会丢信号）。
@@ -87,6 +94,12 @@ type Scheduler struct {
 	// 替代 time.Sleep，优雅停机不必等睡满。Run 未启动（面板先于排程手动触发/测试）
 	// 时回落 context.Background()，行为与 time.Sleep 一致。
 	runCtx atomic.Value // context.Context
+}
+
+// balanceFailState 单账号余额刷新连败状态（仅后台周期路径消费，手动刷新只记不跳）。
+type balanceFailState struct {
+	consecutive int       // 连续失败次数（成功清零、isDirty by design 随进程消失）
+	skipUntil   time.Time // 连败 ≥3 后的跳过截止；零值无跳过
 }
 
 // baseCtx 返回主循环 ctx；Run 未启动时回落 Background（sleepCtx 语义退化为 time.Sleep）。
@@ -117,6 +130,7 @@ func New(cfg Config) *Scheduler {
 	return &Scheduler{
 		cfg:           cfg,
 		adoptTried:    make(map[string]string),
+		balanceState:  make(map[string]balanceFailState),
 		rearmSchedule: make(chan struct{}, 1),
 		rearmBalance:  make(chan struct{}, 1),
 	}
@@ -664,16 +678,15 @@ func (s *Scheduler) RunKeepaliveNow() {
 	}
 }
 
-// RunBalanceRefreshNow 并发查询余额并更新池内 credits。
+// RunBalanceRefreshNow 并发查询余额并更新池内 credits（全库同时发车，供面板手动
+// 全量刷新——人为动作追求立即可见，不做错峰与连败跳过；只记退避计数）。
 // 账号范围：默认跳过禁用账号；schedule.include_disabled_in_tasks 打开时一并刷新
 // （轮换用法下据此判断下一个该启用谁）。注意 ReenableIfCredits 对 disabled 是
 // no-op，所以本开关**不会**导致禁用号被自动解冻——它只让已有账号的积分保持新鲜。
 // 解冻语义与签到一致（ReenableIfCredits：余额 > 0 的冷却账号自动解冻），
 // 但不做签到、不刷新 token——只让"积分"这个观测量保持新鲜。
-// 供两类入口复用：后台周期任务（StartBalanceRefresh）与面板手动全量刷新。
 func (s *Scheduler) RunBalanceRefreshNow() {
 	var wg sync.WaitGroup
-	expiringSoon := s.ExpiringSoonWindow()
 	includeDisabled := s.includeDisabledInTasks()
 	for _, st := range s.cfg.Pool.List() {
 		if st.Disabled && !includeDisabled {
@@ -686,13 +699,130 @@ func (s *Scheduler) RunBalanceRefreshNow() {
 		wg.Add(1)
 		go func(a *auth.Auth, uid string) {
 			defer wg.Done()
-			remain, total, expiring, earliestAt, earliestRemaining, err := s.cfg.Upstream.UserResourceDetailedWithExpiry(a, expiringSoon)
-			if err != nil {
-				log.Printf("balance %s: %v", logfmt.Label(uid, a.Nickname), err)
+			s.refreshOneBalance(a, uid, 0) // interval=0：退避计数但不产生跳过
+		}(a, st.UID)
+	}
+	wg.Wait()
+}
+
+// refreshOneBalance 刷新单账号余额：查上游（内含 3 次瞬时有界重试）→ 回写池内
+// credits/到期批次 → 解冻语义 → 连败/成功按 uid 记退避状态。interval>0 时连败
+// ≥3 会写入 skipUntil 供 RunBalanceRefreshStaggered 跳过；=0（手动路径）只计数。
+func (s *Scheduler) refreshOneBalance(a *auth.Auth, uid string, interval time.Duration) {
+	remain, total, expiring, earliestAt, earliestRemaining, err := s.cfg.Upstream.UserResourceDetailedWithExpiry(a, s.ExpiringSoonWindow())
+	if err != nil {
+		log.Printf("balance %s: %v", logfmt.Label(uid, a.Nickname), err)
+		s.balanceRecordFail(uid, interval)
+		return
+	}
+	s.balanceRecordOk(uid)
+	s.cfg.Pool.ReenableIfCredits(uid, remain, total)
+	s.cfg.Pool.SetCreditsDetailed(uid, remain, total, expiring, earliestAt, earliestRemaining)
+}
+
+// balanceStaggerSpread 后台错峰的总摊开时长：interval/3，上限 90s（interval 极小时
+// 可能 ≤0 → 退化为同时发车，测试友好；极端短间隔本就不该压退避）。
+func balanceStaggerSpread(interval time.Duration) time.Duration {
+	if interval <= 0 {
+		return 0
+	}
+	d := interval / 3
+	if d > 90*time.Second {
+		d = 90 * time.Second
+	}
+	return d
+}
+
+// balanceOffset 按 uid 稳定哈希摊开启动偏移 ∈ [0, spread)：FNV-1a 取模毫秒。
+// 同一 uid 每轮偏移相同——上游抖动窗口往往分钟级，固定错开比随机更省脑（可预测）。
+func balanceOffset(uid string, spread time.Duration) time.Duration {
+	if spread <= 0 {
+		return 0
+	}
+	var h uint32 = 2166136261
+	for i := 0; i < len(uid); i++ {
+		h ^= uint32(uid[i])
+		h *= 16777619
+	}
+	return time.Duration(uint64(h)%uint64(spread/time.Millisecond)) * time.Millisecond
+}
+
+// balanceDecide 报告该账号本轮是否刷新（连败退避窗口内跳过）。持 mu 读。
+func (s *Scheduler) balanceDecide(uid string) (skip bool, state balanceFailState) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	st, ok := s.balanceState[uid]
+	if ok && st.skipUntil.After(time.Now()) {
+		return true, st
+	}
+	return false, st
+}
+
+// balanceRecordOk 刷新成功：清该账号连败/跳过状态。持 mu 写。
+func (s *Scheduler) balanceRecordOk(uid string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if st, ok := s.balanceState[uid]; ok && (st.consecutive > 0 || !st.skipUntil.IsZero()) {
+		delete(s.balanceState, uid)
+	}
+}
+
+// balanceRecordFail 记一次刷新失败（连败计数始终累加，手动路径一并计入）。
+// 第 k 次连败（k≥3）退避至第 k-2 轮之后的半个周期：
+// interval=5m 时 2.5m/5m/7.5m… 封顶 2×interval；interval=0（手动路径）只计数不产生跳过。
+// 持 mu 写。
+func (s *Scheduler) balanceRecordFail(uid string, interval time.Duration) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	st := s.balanceState[uid]
+	st.consecutive++
+	if interval > 0 && st.consecutive >= 3 {
+		d := time.Duration(st.consecutive-2) * (interval / 2)
+		if d > 2*interval {
+			d = 2 * interval
+		}
+		st.skipUntil = time.Now().Add(d)
+	}
+	s.balanceState[uid] = st
+}
+
+// RunBalanceRefreshStaggered 后台周期刷新专用：错峰启动 + 连败退避跳过。
+// 手动全量刷新仍走 RunBalanceRefreshNow（全库齐刷、无跳过）。
+//  - 错峰：每账号按 uid 稳定偏移 <spread> 启动（5m 周期摊 90s），避免 7 个并发
+//    TLS 握手在同 500ms 撞进上游抖动窗口——EOF 风暴是窗口内级联放大出来的；
+//  - 连败退避：≥3 次连续失败（重试尽出仍失败）跳过 0.5~2×interval 轮，抖动窗口
+//    内不再对着同一个号推磨；成功一次整体清零。禁用/暂停过滤与 RunBalanceRefreshNow 同规。
+//
+// 为什么不做随机偏移：uid 哈希偏移每轮固定，行为可复盘（同 uid 总在同一相对时点刷新），
+// 也天然避开「每轮全库同毫秒齐刷」这个和上游限流/抖动互相纠缠的模式。
+func (s *Scheduler) RunBalanceRefreshStaggered(ctx context.Context, interval time.Duration) {
+	includeDisabled := s.includeDisabledInTasks()
+	spread := balanceStaggerSpread(interval)
+	var wg sync.WaitGroup
+	for _, st := range s.cfg.Pool.List() {
+		if st.Disabled && !includeDisabled {
+			continue
+		}
+		a := s.cfg.Pool.AuthByUID(st.UID)
+		if a == nil {
+			continue
+		}
+		if skip, state := s.balanceDecide(st.UID); skip {
+			log.Printf("balance %s: 连败 %d 次，本轮退避跳过（至 %s）",
+				logfmt.Label(st.UID, a.Nickname), state.consecutive,
+				state.skipUntil.Local().Format("15:04:05"))
+			continue
+		}
+		off := balanceOffset(st.UID, spread)
+		wg.Add(1)
+		go func(a *auth.Auth, uid string) {
+			defer wg.Done()
+			select {
+			case <-ctx.Done():
 				return
+			case <-time.After(off):
 			}
-			s.cfg.Pool.ReenableIfCredits(uid, remain, total)
-			s.cfg.Pool.SetCreditsDetailed(uid, remain, total, expiring, earliestAt, earliestRemaining)
+			s.refreshOneBalance(a, uid, interval)
 		}(a, st.UID)
 	}
 	wg.Wait()
@@ -701,7 +831,8 @@ func (s *Scheduler) RunBalanceRefreshNow() {
 // StartBalanceRefresh 后台周期性余额刷新（独立 ticker goroutine，ctx 取消即停）。
 // interval<=0 不启动（schedule.balance_refresh_enabled=false 时 main 不调用即可）。
 // 独立于 Run 的小时制排程：余额是分钟级观测量，不值得为它扩展 nextFire 的粒度。
-// 运行期可用 SetBalanceInterval 热改间隔（下一轮生效）。
+// 运行期可用 SetBalanceInterval 热改间隔（下一轮生效）。执行经
+// RunBalanceRefreshStaggered：错峰启动 + 连败退避（仅后台路径）。
 func (s *Scheduler) StartBalanceRefresh(ctx context.Context, interval time.Duration) {
 	if interval <= 0 {
 		return
@@ -712,7 +843,7 @@ func (s *Scheduler) StartBalanceRefresh(ctx context.Context, interval time.Durat
 		for {
 			cur := time.Duration(s.balanceInterval.Load())
 			if cur != logged {
-				log.Printf("scheduler: 余额后台刷新每 %s（暂停中显示 0s）", cur)
+				log.Printf("scheduler: 余额后台刷新每 %s（暂停中显示 0s；错峰 ≤%s）", cur, balanceStaggerSpread(cur))
 				logged = cur
 			}
 			if cur <= 0 {
@@ -732,7 +863,7 @@ func (s *Scheduler) StartBalanceRefresh(ctx context.Context, interval time.Durat
 			case <-s.rearmBalance:
 				timer.Stop() // 间隔已变：立刻按新值重算
 			case <-timer.C:
-				s.RunBalanceRefreshNow()
+				s.RunBalanceRefreshStaggered(ctx, cur)
 			}
 		}
 	}()

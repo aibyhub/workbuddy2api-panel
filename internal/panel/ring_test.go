@@ -17,7 +17,7 @@ func TestClassifyLine(t *testing.T) {
 		"panel: 队列启动：6 项（并发 2）":                                         ChTask,
 		"panel: revive uid=x":                                           ChSys,
 		"workbuddy2api listening on :7863":                              ChSys,
-		"scheduler: 余额后台刷新每 5m0s":                                       ChSys,
+		"scheduler: 余额后台刷新每 5m0s（暂停中显示 0s；错峰 ≤1m30s）":          ChSys,
 	}
 	for line, want := range cases {
 		if got := classifyLine(line); got != want {
