@@ -51,6 +51,12 @@ type Config struct {
 	// GrowthDisabled 显式关闭成长任务自动排程（schedule.growth_enabled=false）。
 	GrowthDisabled bool
 
+	// IncludeDisabledInTasks 让「保号类」四任务（签到 / 活跃上报 / token 保活 / 余额刷新）
+	// 对已禁用（disabled）的账号也执行（schedule.include_disabled_in_tasks）。
+	// 缺省 false = 保持「禁用的跳过」既有语义；打开后禁用号照常签到保号，但**仍不参与
+	// 选号**——pool.pick 侧的 disabled 过滤与本开关无关。
+	IncludeDisabledInTasks bool
+
 	// GrowthHook 成长任务队列执行回调（panel.RunGrowthQueueOnce：扫描全部账号
 	// 待办并执行，与面板「执行全部待办」按钮同管线）。调度器只管时点不管实现——
 	// panel 在 scheduler 之后构造，用 SetGrowthHook 事后挂载；nil 时到点跳过。
@@ -145,6 +151,23 @@ func (s *Scheduler) SetExpiringSoonWindow(d time.Duration) {
 func (s *Scheduler) SetGrowthHook(fn func()) {
 	s.schedMu.Lock()
 	s.cfg.GrowthHook = fn
+	s.schedMu.Unlock()
+}
+
+// includeDisabledInTasks 返回保号类任务是否应覆盖禁用账号（配置快照，供循环开头取一次）。
+func (s *Scheduler) includeDisabledInTasks() bool {
+	s.schedMu.Lock()
+	defer s.schedMu.Unlock()
+	return s.cfg.IncludeDisabledInTasks
+}
+
+// SetIncludeDisabledInTasks 热更新「保号类任务是否覆盖禁用账号」
+// （schedule.include_disabled_in_tasks）。
+// 用独立 setter 而非并入 Reconfigure：后者已有 12 个位置参数，继续追加会让调用点难以
+// 校对；本开关语义独立（只影响账号过滤，不影响时点），单独设值更清晰。
+func (s *Scheduler) SetIncludeDisabledInTasks(v bool) {
+	s.schedMu.Lock()
+	s.cfg.IncludeDisabledInTasks = v
 	s.schedMu.Unlock()
 }
 
@@ -467,14 +490,16 @@ func sleepCtx(ctx context.Context, d time.Duration) bool {
 }
 
 // RunCheckinNow 立即对所有账号执行签到 + 余额刷新 + 解冻。
-// 冷却中的账号也参与（签到就是为了解冻它们）；禁用的跳过。
+// 冷却中的账号也参与（签到就是为了解冻它们）；禁用账号默认跳过——
+// 若 schedule.include_disabled_in_tasks 打开则一并执行（禁用只关选号，不停保号）。
 // 旅行已从签到剥离为独立排程（travel_hours），不再搭签到便车。
 // 末尾追加连登管家（streak.go）：可兑换档位自动兑换 + 抽奖次数自动抽完——
 // 连登兑换按天数解锁，挂在每日签到后即「到天数那天自动完成兑换→抽奖闭环」。
 func (s *Scheduler) RunCheckinNow() {
 	expiringSoon := s.ExpiringSoonWindow()
+	includeDisabled := s.includeDisabledInTasks()
 	for _, st := range s.cfg.Pool.List() {
-		if st.Disabled {
+		if st.Disabled && !includeDisabled {
 			continue
 		}
 		a := s.cfg.Pool.AuthByUID(st.UID)
@@ -497,20 +522,26 @@ func (s *Scheduler) RunCheckinNow() {
 // checkinAccount 单账号签到 + 余额刷新 + 解冻（从 RunCheckinNow 循环体提出，
 // 供 runAccountBounded 限时执行）。
 func (s *Scheduler) checkinAccount(a *auth.Auth, uid, nickname string, expiringSoon time.Duration) {
-	if err := s.cfg.Upstream.DailyCheckin(a); err != nil {
-		// "今天已签到"是幂等成功（上游对重复签到返回 code!=0），不再当失败打 error 行。
-		if upstream.IsAlreadyCheckin(err) {
-			s.cfg.Pool.NoteCheckinDone(uid)
-			log.Printf("checkin %s: 今天已签到（幂等）", logfmt.Label(uid, nickname))
+	// 企业版无签到体系：上游对 POST /v2/billing/meter/daily-checkin 直接
+	// 400 code 10001「企业账号不支持该操作」。跳过签到，但**不 return**——
+	// 下方余额查询照常跑（企业额度走 get-enterprise-user-usage 口径，且是
+	// credit_floor 判定与面板额度展示的唯一数据源）。
+	if !a.IsEnterprise() {
+		if err := s.cfg.Upstream.DailyCheckin(a); err != nil {
+			// "今天已签到"是幂等成功（上游对重复签到返回 code!=0），不再当失败打 error 行。
+			if upstream.IsAlreadyCheckin(err) {
+				s.cfg.Pool.NoteCheckinDone(uid)
+				log.Printf("checkin %s: 今天已签到（幂等）", logfmt.Label(uid, nickname))
+			} else {
+				log.Printf("checkin %s: %v", logfmt.Label(uid, nickname), err)
+			}
+			// 其余业务错误也继续走余额查询
 		} else {
-			log.Printf("checkin %s: %v", logfmt.Label(uid, nickname), err)
+			// 首次签到成功此前静默——排查「签到到底跑没跑」时无迹可循（幂等行只在
+			// 重复触发时出现），成功也落一行。
+			s.cfg.Pool.NoteCheckinDone(uid)
+			log.Printf("checkin %s: 签到成功", logfmt.Label(uid, nickname))
 		}
-		// 其余业务错误也继续走余额查询
-	} else {
-		// 首次签到成功此前静默——排查「签到到底跑没跑」时无迹可循（幂等行只在
-		// 重复触发时出现），成功也落一行。
-		s.cfg.Pool.NoteCheckinDone(uid)
-		log.Printf("checkin %s: 签到成功", logfmt.Label(uid, nickname))
 	}
 	// 分桶查余额：配置窗口内的积分单独标记，同时记录最早未来到期批次。
 	remain, total, expiring, earliestAt, earliestRemaining, err := s.cfg.Upstream.UserResourceDetailedWithExpiry(a, expiringSoon)
@@ -523,7 +554,8 @@ func (s *Scheduler) checkinAccount(a *auth.Auth, uid, nickname string, expiringS
 }
 
 // RunActivityNow 立即对池内所有可用账号执行一次对话活跃上报。
-// 禁用账号跳过；无 AccessToken 的跳过；账号间限速 activityAccountDelay。
+// 禁用账号默认跳过（schedule.include_disabled_in_tasks 打开时一并上报）；
+// 无 AccessToken 的跳过；账号间限速 activityAccountDelay。
 // CN 与 global 账号**都上报**（PR #45 实测国际版 /v2/report 在 workbuddy.ai 上
 // code=0 OK，点亮连登）；一条上报同时点亮 growth 连登 + 解锁 first_buddy 任务。
 // 上报成功后续跑 streak 自检（checkActivityStreak）：回读连登天数，发现
@@ -537,12 +569,20 @@ func (s *Scheduler) RunActivityNow() {
 // runActivity 活跃上报遍历，随 ctx 取消立即退出。
 func (s *Scheduler) runActivity(ctx context.Context) {
 	first := true
+	includeDisabled := s.includeDisabledInTasks()
 	for _, st := range s.cfg.Pool.List() {
-		if st.Disabled {
+		if st.Disabled && !includeDisabled {
 			continue
 		}
 		a := s.cfg.Pool.AuthByUID(st.UID)
 		if a == nil || a.AccessTokenValue() == "" {
+			continue
+		}
+		// 企业版跳过活跃上报：/v2/report 本身返回 200（不报错），但它唯一的作用是
+		// 点亮 growth 连登天数 / 解锁 first_buddy 领养——这两者对企业号都是 403
+		// （「growth system is only available for personal users」），即**零收益**。
+		// 该类"静默无效"最易被忽略（日志无异常），故显式跳过，不给上游多发一次请求。
+		if a.IsEnterprise() {
 			continue
 		}
 		// global 账号同样上报（PR #45 实测国际版 /v2/report 在 workbuddy.ai 上 code=0 OK，
@@ -589,12 +629,16 @@ func (s *Scheduler) checkActivityStreak(a *auth.Auth) bool {
 }
 
 // RunKeepaliveNow 立即对所有账号刷新 token；session 死亡的自动禁用。
+// 禁用账号默认跳过；若 schedule.include_disabled_in_tasks 打开，禁用号也会续期 token
+// （这是轮换用法下把闲置号保持可用的关键），但**不再对已禁用的号重复计数 12153**——
+// 它已经是终态，再计一次只会打出一行「— 禁用」的误导日志。
 // 12153 禁用走 Pool.NoteSessionDead 的**连续计数**语义：一次刷新失败不再立即杀号，
 // 连续 sessionDeadThreshold 次（3 次）才禁用（P0-1：13 个 disabled 号全是历史误判）。
 // 刷新成功 → ClearSessionDead 清计数（错误判定的账号有复活路径）。
 func (s *Scheduler) RunKeepaliveNow() {
+	includeDisabled := s.includeDisabledInTasks()
 	for _, st := range s.cfg.Pool.List() {
-		if st.Disabled {
+		if st.Disabled && !includeDisabled {
 			continue
 		}
 		a := s.cfg.Pool.AuthByUID(st.UID)
@@ -605,7 +649,7 @@ func (s *Scheduler) RunKeepaliveNow() {
 			if err := s.cfg.Upstream.RefreshToken(a); err != nil {
 				log.Printf("keepalive %s: %v", logfmt.Label(st.UID, st.Nickname), err)
 				var ue *upstream.Error
-				if errors.As(err, &ue) && ue.Kind == upstream.ErrSessionDead {
+				if errors.As(err, &ue) && ue.Kind == upstream.ErrSessionDead && !st.Disabled {
 					if s.cfg.Pool.NoteSessionDead(st.UID) {
 						log.Printf("keepalive %s: 连续 %d 次 12153 session dead — 禁用", logfmt.Label(st.UID, st.Nickname), pool.SessionDeadThreshold())
 					}
@@ -620,15 +664,19 @@ func (s *Scheduler) RunKeepaliveNow() {
 	}
 }
 
-// RunBalanceRefreshNow 并发对所有非禁用账号查询余额并更新池内 credits。
+// RunBalanceRefreshNow 并发查询余额并更新池内 credits。
+// 账号范围：默认跳过禁用账号；schedule.include_disabled_in_tasks 打开时一并刷新
+// （轮换用法下据此判断下一个该启用谁）。注意 ReenableIfCredits 对 disabled 是
+// no-op，所以本开关**不会**导致禁用号被自动解冻——它只让已有账号的积分保持新鲜。
 // 解冻语义与签到一致（ReenableIfCredits：余额 > 0 的冷却账号自动解冻），
 // 但不做签到、不刷新 token——只让"积分"这个观测量保持新鲜。
 // 供两类入口复用：后台周期任务（StartBalanceRefresh）与面板手动全量刷新。
 func (s *Scheduler) RunBalanceRefreshNow() {
 	var wg sync.WaitGroup
 	expiringSoon := s.ExpiringSoonWindow()
+	includeDisabled := s.includeDisabledInTasks()
 	for _, st := range s.cfg.Pool.List() {
-		if st.Disabled {
+		if st.Disabled && !includeDisabled {
 			continue
 		}
 		a := s.cfg.Pool.AuthByUID(st.UID)
