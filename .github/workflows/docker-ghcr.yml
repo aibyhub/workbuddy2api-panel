@@ -10,8 +10,10 @@ on:
     branches:
       - main
     tags:
-      - "v[0-9]+.[0-9]+.[0-9]+"
-      - "v[0-9]+.[0-9]+.[0-9]+-ci"
+      # v* 全放行（含 fork 版本线 v1.13.0-panel-aibyhub.N 这类带字母后缀的 tag）；
+      # 版本一致性由下方 Validate release tag 步骤严格校验（tag 必须等于 v+appVersion），
+      # 不匹配的 tag 会 build 失败，不会推 GHCR。
+      - "v*"
   pull_request:
     paths:
       - "Dockerfile"
