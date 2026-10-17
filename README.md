@@ -246,6 +246,10 @@ curl -s http://localhost:7863/healthz
 > `1.11.10-panel` 时会发布同名镜像 tag；`main` 分支同时推送 `latest` / `main` / `sha-xxxxxx`。
 > 打 `v1.11.10` tag 时还会发布 `1.11.10` / `1.11`；PR 仅构建验证、不推送。
 > 演练 tag 只接受 `v<source>-ci`，仅跑测试与构建，不推送 GHCR / Release。
+>
+> **fork 版本线**：本 fork 的版本号 = 上游基线 + `-aibyhub.<序号>`（如 `1.13.0-panel-aibyhub.1`），
+> 与上游 `1.13.0-panel` 严格区分，避免本命名空间下旧 tag 被新内容覆盖（同 tag 内容漂移）。
+> 对应发版 tag 为 `v<appVersion>`（如 `v1.13.0-panel-aibyhub.1`）。
 
 ### 方式一：Docker Compose（推荐服务器部署）
 
