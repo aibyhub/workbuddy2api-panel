@@ -1,5 +1,5 @@
 // 后台余额刷新的错峰与连败退避测试（RunBalanceRefreshStaggered 语义）：
-//   - 连败 ≥3 → 本轮跳过（上游零调用），退避时长 = (k-2)×interval/2，封顶 2×interval；
+//   - 连败 ≥3 → 本轮跳过（上游零调用），退避时长 = (k-2)×interval（跳 1~2 轮），封顶 2×interval；
 //   - 成功 → 状态清零；
 //   - interval=0（手动路径）只计数、不产生跳过、永不拦截上游调用；
 //   - 错峰偏移确定且 ∈ [0, spread)。
@@ -61,7 +61,7 @@ func TestBalanceStaggeredBackoffSkipsAfterThirdFail(t *testing.T) {
 	s := New(Config{Pool: p, Upstream: up})
 
 	// 三轮：每轮打上游一次（连败 1、2、3）。第三轮（第三次连败）写入 skipUntil
-	// = now+(3-2)×2s/2 = now+1s。
+	// = now+(3-2)×2s = now+2s（退避窗必须 ≥1 周期，才能跳过紧跟着的那一轮）。
 	for i := 1; i <= 3; i++ {
 		n0 := cs.hits.Load()
 		s.RunBalanceRefreshStaggered(context.Background(), 2*time.Second)
@@ -94,9 +94,9 @@ func TestBalanceStaggeredBackoffEasesOffAndRecovers(t *testing.T) {
 	s := New(Config{Pool: p, Upstream: upFail})
 
 	for i := 0; i < 3; i++ {
-		s.refreshOneBalance(p.AuthByUID("u1"), "u1", 4*time.Second) // k=3 → 跳 2s
+		s.refreshOneBalance(p.AuthByUID("u1"), "u1", 4*time.Second) // k=3 → 跳 4s（1 周期）
 	}
-	time.Sleep(2100 * time.Millisecond) // 退避窗滑出
+	time.Sleep(4100 * time.Millisecond) // 退避窗（4s）滑出
 
 	csOk := &countServer{}
 	okSrv, upOk := csOk.start(t)

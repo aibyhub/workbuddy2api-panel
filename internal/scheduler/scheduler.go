@@ -768,16 +768,16 @@ func (s *Scheduler) balanceRecordOk(uid string) {
 }
 
 // balanceRecordFail 记一次刷新失败（连败计数始终累加，手动路径一并计入）。
-// 第 k 次连败（k≥3）退避至第 k-2 轮之后的半个周期：
-// interval=5m 时 2.5m/5m/7.5m… 封顶 2×interval；interval=0（手动路径）只计数不产生跳过。
-// 持 mu 写。
+// 第 k 次连败（k≥3）退避 (k-2)×interval：k=3 跳 1 轮、k=4 跳 2 轮…封顶 2×interval
+// （退避窗必须 ≥1 个周期，否则 5m 周期下窗口在下一轮点火前就过期，形同虚设）。
+// interval=0（手动路径）只计数不产生跳过。持 mu 写。
 func (s *Scheduler) balanceRecordFail(uid string, interval time.Duration) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	st := s.balanceState[uid]
 	st.consecutive++
 	if interval > 0 && st.consecutive >= 3 {
-		d := time.Duration(st.consecutive-2) * (interval / 2)
+		d := time.Duration(st.consecutive-2) * interval
 		if d > 2*interval {
 			d = 2 * interval
 		}
