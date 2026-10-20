@@ -34,7 +34,7 @@ import (
 // appVersion 网关版本（fork 版：面板 + 任务体系），透出到 /panel/api/overview。
 // fork 版本线 = 上游基线 -panel + fork 标识：1.13.0(上游基线) + -aibyhub.<序号>，
 // 与上游同基线时版本号不再撞车（GHCR aibyhub 命名空间下旧 1.13.0-panel 已发布过）。
-const appVersion = "1.13.0-panel-aibyhub.4"
+const appVersion = "1.13.0-panel-aibyhub.5"
 
 // usagePathFor 由 state 文件路径推出用量文件路径：同目录、文件名 usage.json。
 // 这样 config 里改 state_file 时用量数据跟着走，不需要额外配置项。
@@ -317,12 +317,14 @@ func main() {
 		StickyCount:  sessCount,
 		RedisMode:    redisMode,
 		SoftCooldown: cfg.SoftRateDur,
-		Panel:        pn,
-		Live:         live,
-		Usage:        rec,
-		RequestLog:   requestLog,
-		PromptMode:   cfg.Prompt.Mode,
-		PromptText:   cfg.PromptText,
+		// 超时有界加转：config 缺省 1，config.json "timeout_rotate_extra": 0 显式关。
+		TimeoutRotateExtra: cfg.TimeoutRotateExtra,
+		Panel:              pn,
+		Live:               live,
+		Usage:              rec,
+		RequestLog:         requestLog,
+		PromptMode:         cfg.Prompt.Mode,
+		PromptText:         cfg.PromptText,
 		// 来源记录开关经 livecfg 热生效；此处同时填静态字段，供 Live 为 nil 的
 		// 裸用/测试路径拿到同一缺省值。
 		RecordClientInfo: cfg.Logging.RequestClientInfo,

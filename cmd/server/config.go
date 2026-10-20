@@ -63,6 +63,12 @@ type Config struct {
 		SoftRateMax string `json:"soft_rate_max"` // "2h"
 	} `json:"cooldown"`
 
+	// TimeoutRotateExtra 上游超时（传输层 timeout）时的有界加转预算。
+	// 缺省 1：首次超时仍给一次换号机会（不同账号可能走不同出口隧道，"换号必撞
+	// 同一慢上游"不是普遍成立），加转耗尽或再次超时即止损——最坏 latency 2×timeout。
+	// 0 = 显式关闭回到纯止损旧行为；负数 normalize 修正为 0。
+	TimeoutRotateExtra int `json:"timeout_rotate_extra"`
+
 	Schedule struct {
 		CheckinHours   []int `json:"checkin_hours"`   // [9,21]
 		TravelHours    []int `json:"travel_hours"`    // [9,21]
@@ -482,6 +488,10 @@ func (c *Config) normalize() error {
 	if c.ServerReadTimeoutDur < 0 {
 		return fmt.Errorf("server.read_timeout: 负时长 %q 无意义", c.Server.ReadTimeout)
 	}
+	// 超时加转预算：0=显式关，负数直接按无意义报错（与 read_timeout 同风格）。
+	if c.TimeoutRotateExtra < 0 {
+		return fmt.Errorf("timeout_rotate_extra: 负值 %d 无意义（0=关）", c.TimeoutRotateExtra)
+	}
 	if c.SoftRateDur, err = time.ParseDuration(c.Cooldown.SoftRate); err != nil {
 		return fmt.Errorf("cooldown.soft_rate: %w", err)
 	}
@@ -561,6 +571,8 @@ func (c *Config) normalize() error {
 	}
 	if c.Upstream.TimeoutSeconds <= 0 {
 		c.Upstream.TimeoutSeconds = 120
+		// 上游超时有界加转缺省 1（0=显式关）。
+		c.TimeoutRotateExtra = 1
 	}
 	// header 缺省回落 timeout（保"首字节前换号"既有语义）；idle 缺省走内置大值。
 	// 任务书约定：0 一律视为"未设置"走默认，真正的"禁用"留待后续（避免歧义）。

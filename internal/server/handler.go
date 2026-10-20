@@ -34,6 +34,11 @@ type Config struct {
 	Upstream  *upstream.Client
 	APIKey    string // 空 = 不鉴权（静态值；与 Live 同时给出时 Live 优先）
 	MaxRotate int    // 单请求最多换号次数，默认 3
+	// TimeoutRotateExtra 上游超时时的**有界加转预算**（0 = 关，纯止损旧行为）。
+	// 缺省语义：未设置（0）即关——cmd/server 的 config Default() 注入 1。
+	// 首次超时仍给一次换号机会：并非所有账号走同一出口隧道（socks 出口分多路），
+	// 一条腿挂≠全体同款；但只加转 TimeoutRotateExtra 次，上限 2×timeout，不铺满轮。
+	TimeoutRotateExtra int
 	// Session 会话粘性路由器（可选；nil = 关闭粘性，纯 Pick 轮换）。
 	Session *session.Router
 	// StickyCount 返回当前粘性会话绑定数（供 /status）；nil 时报告 0。
@@ -748,6 +753,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 	chatMeta.TraceID = r.Header.Get("X-Trace-ID")
 
+	timeoutExtra := 0 // 上游超时有界加转预算（TimeoutRotateExtra），成功用非超时耗尽
 	for i := 0; i < h.cfg.MaxRotate; i++ {
 		// 选号：粘性号优先（PickByUIDForModel 已校验该模型可用性 + 在途未满），否则普通轮换。
 		var acct *auth.Auth
@@ -843,6 +849,17 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				recordAttempt(acct.UID, pool.TokenUsageDelta{}, 0, false, attemptStarted, 0)
 				st.status = http.StatusServiceUnavailable
 				lastErr = fmt.Errorf("%w: %v", errUpstreamTimeout, terr)
+				// 有界加转（timeout_rotate_extra）：首次超时仍给一次换号机会——
+				// 试图反驳「换号必然撞同一个慢上游」的假设；反驳失败即止损
+				// （最坏 latency 2×timeout，不铺 MaxRotate 全量）。退避失败（ctx
+				// 取消）同样终止。账号全程不罚（不喂连败/不冷却）。
+				if timeoutExtra < h.cfg.TimeoutRotateExtra && rotateBackoff(i, r.Context()) {
+					timeoutExtra++
+					fail(acct.UID)
+					log.Printf("WARN: [server] upstream timeout acct=%s: %v → extra rotation #%d/%d (bounded, account not penalized)",
+						logfmt.Label(acct.UID, acct.Nickname), terr, timeoutExtra, h.cfg.TimeoutRotateExtra)
+					continue
+				}
 				log.Printf("WARN: [server] upstream timeout acct=%s: %v (rotation stopped, account not penalized)",
 					logfmt.Label(acct.UID, acct.Nickname), terr)
 				break
