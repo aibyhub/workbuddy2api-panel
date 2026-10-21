@@ -23,6 +23,9 @@ func TestDefault(t *testing.T) {
 	if c.TimeoutRotateExtra != 1 {
 		t.Fatalf("timeout_rotate_extra default=%d want 1", c.TimeoutRotateExtra)
 	}
+	if c.CrossRealmFallback != 1 || c.CrossRealmFallbackRealm != "global" {
+		t.Fatalf("cross_realm_fallback default=%d/%q want 1/global", c.CrossRealmFallback, c.CrossRealmFallbackRealm)
+	}
 }
 
 // TestTimeoutRotateExtraDefaults 钉死键语义：键缺席 → Default() 的 1 存活
@@ -46,6 +49,49 @@ func TestTimeoutRotateExtraDefaults(t *testing.T) {
 	}
 	if _, err := ParseConfig([]byte(`{"timeout_rotate_extra":-1}`)); err == nil {
 		t.Fatal("negative extra must be rejected")
+	}
+}
+
+// TestCrossRealmFallbackDefaults 钉死跨域兜底双键语义（与
+// TestTimeoutRotateExtraDefaults 同款回归锁）：键缺席 → 开(1) + global 存活
+// （2026-10-21 glm-5.3 事故修复：老 config.json 无此键的部署默认开启兜底）；
+// 显式 0 = 严格旧行为（裸名恒主域，不跨）；负值报错；显式设域被保留。
+func TestCrossRealmFallbackDefaults(t *testing.T) {
+	missing, err := ParseConfig([]byte(`{"server":{"read_timeout":"300s"}}`))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if missing.CrossRealmFallback != 1 {
+		t.Fatalf("missing-key fallback=%d want 1", missing.CrossRealmFallback)
+	}
+	if missing.CrossRealmFallbackRealm != "global" {
+		t.Fatalf("missing-key realm=%q want global", missing.CrossRealmFallbackRealm)
+	}
+	off, err := ParseConfig([]byte(`{"cross_realm_fallback":0}`))
+	if err != nil {
+		t.Fatalf("parse off: %v", err)
+	}
+	if off.CrossRealmFallback != 0 {
+		t.Fatalf("explicit 0 turned to %d", off.CrossRealmFallback)
+	}
+	if _, err := ParseConfig([]byte(`{"cross_realm_fallback":-1}`)); err == nil {
+		t.Fatal("negative fallback must be rejected")
+	}
+	// 开启但域显式为空 → normalize 补 global（不可静默失效成单域）。
+	emptyRealm, err := ParseConfig([]byte(`{"cross_realm_fallback":1,"fallback_realm":""}`))
+	if err != nil {
+		t.Fatalf("parse empty realm: %v", err)
+	}
+	if emptyRealm.CrossRealmFallbackRealm != "global" {
+		t.Fatalf("empty fallback realm backfilled to %q want global", emptyRealm.CrossRealmFallbackRealm)
+	}
+	// 显式自定义域被保留（如用户想 global→cn 方向兜底）。
+	custom, err := ParseConfig([]byte(`{"fallback_realm":"cn"}`))
+	if err != nil {
+		t.Fatalf("parse custom: %v", err)
+	}
+	if custom.CrossRealmFallback != 1 || custom.CrossRealmFallbackRealm != "cn" {
+		t.Fatalf("custom realm lost: %d/%q want 1/cn", custom.CrossRealmFallback, custom.CrossRealmFallbackRealm)
 	}
 }
 

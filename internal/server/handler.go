@@ -39,6 +39,16 @@ type Config struct {
 	// 首次超时仍给一次换号机会：并非所有账号走同一出口隧道（socks 出口分多路），
 	// 一条腿挂≠全体同款；但只加转 TimeoutRotateExtra 次，上限 2×timeout，不铺满轮。
 	TimeoutRotateExtra int
+	// CrossRealmFallback 裸名模型请求跨域兜底开关（0 = 关，1 = 开）。
+	// 裸名（无 cn:/global: 前缀）的域归属是网关内部约定（历史上恒 cn），不是调用方
+	// 显式意图；当主域（cn）对某模型选不出任何可用账号（整池模型级 6004 冷却 / 熔断 /
+	// 在途满）时，允许用 fallback 域（CrossRealmFallbackRealm，默认 global）的账号承接。
+	// 2026-10-21 生产事故根因修复：cn 池 glm-5.3 整池 6004 → 裸名请求钉死
+	// no_healthy_account，而 global 区同名模型健康；跨域兜底让裸名请求存活，cn 配额
+	// （6004 重置墙钟）恢复后自然回切主域。显式 cn:/global: 前缀仍严格单域不跨。
+	CrossRealmFallback int
+	// CrossRealmFallbackRealm 跨域兜底目标域。空串/等于主域 = 单域（机制关闭）。
+	CrossRealmFallbackRealm string
 	// Session 会话粘性路由器（可选；nil = 关闭粘性，纯 Pick 轮换）。
 	Session *session.Router
 	// StickyCount 返回当前粘性会话绑定数（供 /status）；nil 时报告 0。
@@ -541,6 +551,20 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	// bareModel 用于选号/粘性/出站 body 重写（前缀是网关侧路由协议，上游只认裸名）。
 	// 裸名 → ("cn", 原串)，CN 现状零回归。
 	realm, bareModel := resolveModel(peek.Model)
+	// 跨域兜底序列：裸名请求 → [主域, 兜底域]；显式前缀 → 严格单域。
+	fallbackRealm := ""
+	if h.cfg.CrossRealmFallback == 1 {
+		fallbackRealm = h.cfg.CrossRealmFallbackRealm
+	}
+	allowedRealms := realmChain(peek.Model, realm, fallbackRealm)
+	// realmOfAcctAllowed 判定账号域是否落在允许序列内：粘性判定与普通选号的
+	// 统一谓词。realm==""（防御空域）时不过滤（与旧 `realm != ""` 守卫同语义）。
+	realmOfAcctAllowed := func(acctRealm string) bool {
+		if realm == "" {
+			return true
+		}
+		return realmInChain(acctRealm, allowedRealms)
+	}
 	modelRate := ""
 	if h.cfg.Upstream != nil {
 		modelRate = h.cfg.Upstream.ModelRate(realm, bareModel)
@@ -759,9 +783,9 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		var acct *auth.Auth
 		if stickyUID != "" {
 			acct = h.cfg.Pool.PickByUIDForModel(stickyUID, bareModel)
-			if acct == nil || (realm != "" && acct.Realm() != realm) {
-				// 粘性号在当前模型不可用（冷却/占满/该模型被 6004 限额）或 realm 不符 → 解绑，
-				// 本次回落普通轮换。
+			if acct == nil || !realmOfAcctAllowed(acct.Realm()) {
+				// 粘性号在当前模型不可用（冷却/占满/该模型被 6004 限额）或域不符
+				// （不在允许序列内）→ 解绑，本次回落普通轮换。
 				unbindSticky()
 				acct = nil
 			}
@@ -770,6 +794,17 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			// 模型感知 + realm 感知选号：模型非空时启用 6004 模型级冷却豁免
 			// （healthyForModel），realm 谓词过滤跨域账号。
 			acct = h.cfg.Pool.PickExcludingForRealm(tried, bareModel, realm)
+			// 跨域兜底：主域选不出号（如 cn 池整池 6004 模型级冷却）且本次为裸名
+			// 请求（allowedRealms.length>1）时，用兜底域补充选号——6004 模型豁免、
+			// tried 请求级轮换、在途租约语义全部不变。兜底命中后该账号若上游仍失败，
+			// 照常进入 tried，下一轮继续轮转（不额外加轮）。
+			if acct == nil && len(allowedRealms) > 1 {
+				acct = h.cfg.Pool.PickExcludingForRealm(tried, bareModel, allowedRealms[1])
+				if acct != nil {
+					log.Printf("[chat] realm fallback primary=%s -> %s (acct=%s model=%s)",
+						realm, allowedRealms[1], logfmt.Label(acct.UID, acct.Nickname), bareModel)
+				}
+			}
 		}
 		if acct == nil {
 			st.status = http.StatusServiceUnavailable

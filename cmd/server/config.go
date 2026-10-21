@@ -69,6 +69,15 @@ type Config struct {
 	// 0 = 显式关闭回到纯止损旧行为；负数 normalize 修正为 0。
 	TimeoutRotateExtra int `json:"timeout_rotate_extra"`
 
+	// CrossRealmFallback 裸名模型请求跨域兜底（0 = 关，1 = 开）。缺省 1：裸名的域归属
+	// （cn）是网关历史约定而非调用方显式意图，主域对某模型整池不可用（典型：cn 池
+	// 全体账号模型级 6004 冷却，如 2026-10-21 glm-5.3）时允许 fallback 域承接。
+	// 显式 cn:/global: 前缀的请求严格单域，不受此开关影响。
+	CrossRealmFallback int `json:"cross_realm_fallback"`
+	// CrossRealmFallbackRealm 跨域兜底目标域。缺省 "global"（normalize 补齐）；
+	// 设为主域同名（如 "cn"）等于机制关闭。
+	CrossRealmFallbackRealm string `json:"fallback_realm"`
+
 	Schedule struct {
 		CheckinHours   []int `json:"checkin_hours"`   // [9,21]
 		TravelHours    []int `json:"travel_hours"`    // [9,21]
@@ -283,6 +292,9 @@ func Default() *Config {
 	// 上游超时有界加转缺省 1（0=显式关；normalize 只拦负数，不在此补值——
 	// Default() 是唯一默认注入点，config.json 显式 0 才能真正关掉）。
 	c.TimeoutRotateExtra = 1
+	// 裸名模型跨域兜底缺省 1（同款唯一默认注入点）；兜底域缺省 global。
+	c.CrossRealmFallback = 1
+	c.CrossRealmFallbackRealm = "global"
 	// HeaderTimeoutSeconds/IdleTimeoutSeconds 默认 0（未设置态），回落见 normalize()。
 	c.Upstream.HeaderTimeoutSeconds = 0
 	c.Upstream.IdleTimeoutSeconds = 0
@@ -494,6 +506,16 @@ func (c *Config) normalize() error {
 	// 超时加转预算：0=显式关，负数直接按无意义报错（与 read_timeout 同风格）。
 	if c.TimeoutRotateExtra < 0 {
 		return fmt.Errorf("timeout_rotate_extra: 负值 %d 无意义（0=关）", c.TimeoutRotateExtra)
+	}
+	// 跨域兜底：同款负数拦截；兜底目标域在开启且为空时补默认 global
+	// （Default() 已置值，此兜底覆盖显式 "" 与 Default() 被绕过的场景）。
+	// 显式 "" + 开启等同于关闭兜底（realmChain 空 fallback → 单域），但那样语义
+	// 含混，不如直接补齐成 global 让行为可预期。
+	if c.CrossRealmFallback < 0 {
+		return fmt.Errorf("cross_realm_fallback: 负值 %d 无意义（0=关）", c.CrossRealmFallback)
+	}
+	if c.CrossRealmFallback != 0 && c.CrossRealmFallbackRealm == "" {
+		c.CrossRealmFallbackRealm = "global"
 	}
 	if c.SoftRateDur, err = time.ParseDuration(c.Cooldown.SoftRate); err != nil {
 		return fmt.Errorf("cooldown.soft_rate: %w", err)
