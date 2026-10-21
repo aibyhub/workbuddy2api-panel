@@ -280,6 +280,9 @@ func Default() *Config {
 	c.Schedule.BalanceRefreshEnabled = true
 	c.Schedule.BalanceRefreshMinutes = 5
 	c.Upstream.TimeoutSeconds = 120
+	// 上游超时有界加转缺省 1（0=显式关；normalize 只拦负数，不在此补值——
+	// Default() 是唯一默认注入点，config.json 显式 0 才能真正关掉）。
+	c.TimeoutRotateExtra = 1
 	// HeaderTimeoutSeconds/IdleTimeoutSeconds 默认 0（未设置态），回落见 normalize()。
 	c.Upstream.HeaderTimeoutSeconds = 0
 	c.Upstream.IdleTimeoutSeconds = 0
@@ -571,8 +574,6 @@ func (c *Config) normalize() error {
 	}
 	if c.Upstream.TimeoutSeconds <= 0 {
 		c.Upstream.TimeoutSeconds = 120
-		// 上游超时有界加转缺省 1（0=显式关）。
-		c.TimeoutRotateExtra = 1
 	}
 	// header 缺省回落 timeout（保"首字节前换号"既有语义）；idle 缺省走内置大值。
 	// 任务书约定：0 一律视为"未设置"走默认，真正的"禁用"留待后续（避免歧义）。

@@ -20,6 +20,33 @@ func TestDefault(t *testing.T) {
 	if c.SoftRateDur.Seconds() != 600 {
 		t.Errorf("soft=%v want 600s", c.SoftRateDur)
 	}
+	if c.TimeoutRotateExtra != 1 {
+		t.Fatalf("timeout_rotate_extra default=%d want 1", c.TimeoutRotateExtra)
+	}
+}
+
+// TestTimeoutRotateExtraDefaults 钉死键语义：键缺席 → Default() 的 1 存活
+// （历史 config.json 无此键的部署默认开启）；显式 0 = 关；负值报错。
+// 这是 .5 翻车的回归锁：默认值曾被塞进 normalize 的 TimeoutSeconds<=0 死分支，
+// config.json 显式设了 timeout_seconds 的部署（ll）运行时恒额外=0，加转失效。
+func TestTimeoutRotateExtraDefaults(t *testing.T) {
+	missing, err := ParseConfig([]byte(`{"server":{"read_timeout":"300s"}}`))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if missing.TimeoutRotateExtra != 1 {
+		t.Fatalf("missing-key extra=%d want 1", missing.TimeoutRotateExtra)
+	}
+	off, err := ParseConfig([]byte(`{"timeout_rotate_extra":0}`))
+	if err != nil {
+		t.Fatalf("parse off: %v", err)
+	}
+	if off.TimeoutRotateExtra != 0 {
+		t.Fatalf("explicit 0 turned to %d", off.TimeoutRotateExtra)
+	}
+	if _, err := ParseConfig([]byte(`{"timeout_rotate_extra":-1}`)); err == nil {
+		t.Fatal("negative extra must be rejected")
+	}
 }
 
 func TestPanelPackageDetailLimit(t *testing.T) {
