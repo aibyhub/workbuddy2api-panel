@@ -133,6 +133,12 @@ type Handler struct {
 	// wafIP WAF IP 级拦截状态机（fail-fast，wafip.go）：短窗多号 WAF 403 →
 	// 激活期轮转遇 WAF 403 直接终止（不放大请求量）。进程内状态、重启清零。
 	wafIP wafIPGate
+	// 模型级挂死熔断（fast-fail，hang.go）：窗内多笔独立请求都「上游停滞」
+	// （表头超时 / 传输层故障 / 流内中断）→ 保持期内该模型入口立即 503，
+	// 不再陪上游黑溺干等。进程内状态、重启清零。
+	hangMu    sync.Mutex
+	hangHits  map[string][]time.Time
+	hangUntil map[string]time.Time
 }
 
 // NewHandler 构建 handler。
@@ -149,7 +155,12 @@ func NewHandler(cfg Config) *Handler {
 	if cfg.PromptMode == "" {
 		cfg.PromptMode = "demote" // 缺省 demote：system 恒定网关提示词 + 调用方 system 降级为对话首条 user
 	}
-	h := &Handler{cfg: cfg, mux: http.NewServeMux()}
+	h := &Handler{
+		cfg:       cfg,
+		mux:       http.NewServeMux(),
+		hangHits:  map[string][]time.Time{},
+		hangUntil: map[string]time.Time{},
+	}
 	h.mux.HandleFunc("POST /v1/chat/completions", h.withAuth(h.chatCompletions))
 	h.mux.HandleFunc("GET /v1/models", h.withAuth(h.models))
 	h.mux.HandleFunc("GET /status", h.withAuth(h.status))
@@ -580,6 +591,28 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 	defer st.done()
 
+	// 模型级挂死熔断入口（fast-fail，hang.go）：熔断保持期内该模型请求不再
+	// 进轮转干等（账号轮换对"上游管道冻结"无解，同一份请求只会重复黑溺），
+	// 连进站的请求转 503 快速失败，保持期过后自动放行试恢复。
+	if h.hangBlocked(bareModel) {
+		log.Printf("WARN: [server] hang guard: %s fast-fail 503 (model in hang hold, entry rejected)", bareModel)
+		st.status = http.StatusServiceUnavailable
+		st.outcome = reqlog.OutcomeHTTPError
+		writeOpenAIError(w, http.StatusServiceUnavailable, "model_temporarily_down",
+			"model is temporarily unavailable: repeated upstream stalls (circuit open, retries automatically after 5 minutes)")
+		return
+	}
+	// hangNoted：本次请求的停滞信号已记过（一请求一记，轮换中不重复触发熔断计数）。
+	hangNoted := false
+	noteHangOnce := func(reason string) {
+		if hangNoted {
+			return
+		}
+		hangNoted = true
+		log.Printf("WARN: [server] hang guard: %s note upstream stall (%s)", bareModel, reason)
+		h.noteModelHang(bareModel)
+	}
+
 	tried := map[string]bool{}
 	var lastErr error
 	// modelBlock 记录本次是否因「模型级冷却」而选不到号（下方 acct==nil 分支填充）。
@@ -884,6 +917,9 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				recordAttempt(acct.UID, pool.TokenUsageDelta{}, 0, false, attemptStarted, 0)
 				st.status = http.StatusServiceUnavailable
 				lastErr = fmt.Errorf("%w: %v", errUpstreamTimeout, terr)
+				// 挂死熔断（hang.go）：上游停滞记模型观察窗——独立请求窗内两笔
+				// 都停滞就熔断，保持期内入口直接 503，不再陪上游黑溺干等。
+				noteHangOnce("table timeout/watchdog kill")
 				// 有界加转（timeout_rotate_extra）：首次超时仍给一次换号机会——
 				// 试图反驳「换号必然撞同一个慢上游」的假设；反驳失败即止损
 				// （最坏 latency 2×timeout，不铺 MaxRotate 全量）。退避失败（ctx
@@ -906,6 +942,9 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			recordAttempt(acct.UID, pool.TokenUsageDelta{}, 0, false, attemptStarted, 0)
 			st.status = http.StatusServiceUnavailable
 			lastErr = terr
+			// 挂死熔断（hang.go）：传输层故障同样记模型观察窗（与账号侧连败
+			// 计数独立——熔断针对的是模型线整体阻塞，不是单个号）。
+			noteHangOnce("transport failure")
 			h.cfg.Pool.NoteFailures(acct.UID)
 			fail(acct.UID)
 			if !rotateBackoff(i, r.Context()) {
@@ -1065,11 +1104,24 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				st.outcome = reqlog.OutcomeStreamError
 				log.Printf("WARN: [server] stream acct=%s model=%s: upstream error frame kind=%s payload=%s",
 					logfmt.Label(acct.UID, acct.Nickname), bareModel, kind, logfmt.Truncate(errFrame, 200))
+			case sErr != nil && r.Context().Err() == nil:
+				// 上游流内中断而客户端健在（空闲看门狗掐流 / 上游断连）：此前
+				// 落进"客户端断连"分支被记成功——冻结号被当成健康号、粘性还会
+				// 把会话钉在它身上（2026-10-22 复盘实证）。改为：观测 502、
+				// 记模型挂死观察窗、不记成功、不清负缓存、不绑粘性。
+				// （StreamHint 已在流尾补 error 帧 + [DONE]，客户端可正常收尾。）
+				st.status = http.StatusBadGateway
+				st.outcome = reqlog.OutcomeStreamError
+				log.Printf("WARN: [server] stream acct=%s model=%s: upstream stream interrupted (client alive): %v → note hang guard",
+					logfmt.Label(acct.UID, acct.Nickname), bareModel, sErr)
+				h.cfg.Pool.NoteFailures(acct.UID)
+				noteHangOnce("mid-stream interruption")
 			case sErr != nil:
 				// 客户端写失败（断连）：上游帧无恙，账号健康——账号侧照常记成功
 				// （与 default 同语义），请求日志归为 Interrupted（人已走，未完成）。
 				st.outcome = reqlog.OutcomeInterrupted
 				h.cfg.Pool.NoteSuccess(acct.UID)
+				h.noteModelOK(bareModel)
 				h.cfg.Pool.BlockModelClear(acct.UID, bareModel)
 				if sessKey != "" && h.cfg.Session != nil {
 					h.cfg.Session.Bind(sessKey, acct.UID)
@@ -1078,6 +1130,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				// 真成功：这一跳读完且上游没有报错，才记成功并让粘性跟上。
 				st.outcome = reqlog.OutcomeSuccess
 				h.cfg.Pool.NoteSuccess(acct.UID)
+				h.noteModelOK(bareModel)
 				// 11102 负缓存清命：该账号该模型实测成功，立即解除避让（不必等 TTL 到期）。
 				// BlockModelClear 按 "11102" reason 前缀识别，只清 11102 条目、不碰 6004 独立冷却。
 				h.cfg.Pool.BlockModelClear(acct.UID, bareModel)
@@ -1164,6 +1217,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		st.toks = completionTokens(resp)
 		// 非流式同理：聚合成功（无 error 帧、非空流）才算这一跳成功，事后才记成功/绑粘性。
 		h.cfg.Pool.NoteSuccess(acct.UID)
+		h.noteModelOK(bareModel)
 		h.cfg.Pool.BlockModelClear(acct.UID, bareModel)
 		if sessKey != "" && h.cfg.Session != nil {
 			h.cfg.Session.Bind(sessKey, acct.UID)

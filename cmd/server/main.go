@@ -34,7 +34,7 @@ import (
 // appVersion 网关版本（fork 版：面板 + 任务体系），透出到 /panel/api/overview。
 // fork 版本线 = 上游基线 -panel + fork 标识：1.13.0(上游基线) + -aibyhub.<序号>，
 // 与上游同基线时版本号不再撞车（GHCR aibyhub 命名空间下旧 1.13.0-panel 已发布过）。
-const appVersion = "1.13.0-panel-aibyhub.7"
+const appVersion = "1.13.0-panel-aibyhub.8"
 
 // usagePathFor 由 state 文件路径推出用量文件路径：同目录、文件名 usage.json。
 // 这样 config 里改 state_file 时用量数据跟着走，不需要额外配置项。

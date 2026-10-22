@@ -745,6 +745,15 @@ readLoop:
 			if err == io.EOF {
 				break
 			}
+			// 流内读中断（上游断连 / 空闲看门狗掐流）：HTTP 头已发出、状态码
+			// 无法再改——补 error 帧 + [DONE] 兜底终态，客户端才能正常收尾，
+			// 而不是把半截流读成「等下一帧直到永远」。兜底帧走 writeSSE 直写
+			// （不经 hintFn，与空流兜底同理由：hintFn 闭包可能携带上一帧上下文）。
+			_ = writeSSE(`{"error":{"message":"upstream stream interrupted","type":"upstream_error","code":"upstream_parse"}}`)
+			_, _ = io.WriteString(w, "data: [DONE]\n\n")
+			if fl != nil {
+				fl.Flush()
+			}
 			return err
 		}
 	}
