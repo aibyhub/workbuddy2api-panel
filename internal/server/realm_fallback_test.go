@@ -2,6 +2,7 @@ package server
 
 import (
 	"encoding/json"
+	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
@@ -101,8 +102,11 @@ func TestChatExplicitCNPrefixNeverCrosses(t *testing.T) {
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions",
 		strings.NewReader(`{"model":"cn:glm-5.3","messages":[]}`)))
-	if rec.Code != 429 {
-		t.Fatalf("code=%d body=%s (want ErrSoftRate 429, no realm cross)", rec.Code, rec.Body)
+	// 合并上游 #81/#102 后：单账号模型级冷却在末端归一为 400 model_unavailable
+	// （换号必败、不可重试），不再透传 legacy 429；本用例的语义核心是
+	// 「显式前缀严格单域」——global 零调用 + 模型级阻塞错误形态。
+	if rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), "model_unavailable") {
+		t.Fatalf("code=%d body=%s (want 400 model_unavailable, no realm cross)", rec.Code, rec.Body)
 	}
 	var e map[string]any
 	json.Unmarshal(rec.Body.Bytes(), &e)
@@ -132,8 +136,10 @@ func TestChatCrossRealmFallbackDisabled(t *testing.T) {
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions",
 		strings.NewReader(`{"model":"glm-5.3","messages":[]}`)))
-	if rec.Code != 429 {
-		t.Fatalf("code=%d body=%s (want legacy 429, no realm cross)", rec.Code, rec.Body)
+	// 合并上游 #81/#102 后：模型级冷却的裸名请求末端归一为 400 model_unavailable；
+	// 本用例的语义核心是「开关关闭 → 不跨域」——global 零调用 + 阻塞错误形态。
+	if rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), "model_unavailable") {
+		t.Fatalf("code=%d body=%s (want 400 model_unavailable, no realm cross)", rec.Code, rec.Body)
 	}
 	if glbCalls != 0 {
 		t.Fatalf("global account called %d times, want 0 (fallback disabled)", glbCalls)

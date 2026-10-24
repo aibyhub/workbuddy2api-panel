@@ -16,34 +16,41 @@ import (
 // Pick 单一选号入口（无请求级轮换、无 realm 过滤，模型感知缺省账号级）。
 // 需要请求级轮换（tried）或分池（realm）时用 PickExcludingForRealm。
 func (p *Pool) Pick() *auth.Auth {
-	return p.pick(nil, "", "")
+	return p.pick(nil, "", "", true)
 }
 
 // PickExcluding 同上，但跳过 tried 中的 uid（请求级轮换）。
 // 挑选策略：healthy 账号中按权重取前 5 名，再在 Top5 内按同一权重加权随机抽签，
 // 意图是打散热点，避免永远打同一个账号。
 func (p *Pool) PickExcluding(tried map[string]bool) *auth.Auth {
-	return p.pick(tried, "", "")
+	return p.pick(tried, "", "", true)
 }
 
 // PickExcludingForModel 模型感知选号：等同 PickExcluding，但对「6004 模型级冷却中的
 // 账号」进行模型豁免——请求模型与其 trigger 模型不同时视为可用（issue #31）。
 // reqModel 为空时即普通 PickExcluding（不影响既有调用语义）。
 func (p *Pool) PickExcludingForModel(tried map[string]bool, reqModel string) *auth.Auth {
-	return p.pick(tried, reqModel, "")
+	return p.pick(tried, reqModel, "", true)
 }
 
 // PickExcludingForRealm 模型感知 + 分池选号：候选集先按 Realm()==realm 过滤
 // （realm 空 = 不过滤，退化为 PickExcludingForModel），再按模型健康口径判定。
 // 供 handler 在 global/cn 双域下分流（global 模型请求只路由 global 账号）。
 func (p *Pool) PickExcludingForRealm(tried map[string]bool, reqModel, realm string) *auth.Auth {
-	return p.pick(tried, reqModel, realm)
+	return p.pick(tried, reqModel, realm, true)
+}
+
+// PickExcludingForRealmStrict 域感知选号（strict：无 healthy 候选即返回 nil，
+// 不做全冷却彩票兜底）。跨域分级兜底依赖本方法的「整域冷却」信号——若主域
+// 在池内先捞软冷却号，跨域永远轮不到（cross_domain_fallback_test 锁此语义）。
+func (p *Pool) PickExcludingForRealmStrict(tried map[string]bool, reqModel, realm string) *auth.Auth {
+	return p.pick(tried, reqModel, realm, false)
 }
 
 // pick 在 healthy 候选集中按权重加权随机选出账号，并记录 lastUsed（防并发撞号）。
 // reqModel 非空时把健康口径换成 healthyForModel（6004 模型豁免生效）。
 // realm 非空时候选过滤叠加 Realm()==realm 谓词（分池选号域）。
-func (p *Pool) pick(tried map[string]bool, reqModel, realm string) *auth.Auth {
+func (p *Pool) pick(tried map[string]bool, reqModel, realm string, allowLottery bool) *auth.Auth {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	now := time.Now()
@@ -78,6 +85,12 @@ func (p *Pool) pick(tried map[string]bool, reqModel, realm string) *auth.Auth {
 	if len(cands) == 0 {
 		// 全冷却兜底：无 healthy 候选时，从冷却账号里选 until 最早到期的一个
 		// （熔断/冷却共用 expiry 口径，取较早截止者）。禁用的账号永不参与兜底。
+		if !allowLottery {
+			return nil // strict：把「整域冷却」交给调用方（跨域分级兜底用）
+		}
+		if p.strategyForRealmLocked(realm) != WeightedRandom {
+			return nil // 有序策略等待恢复，不提前试探仍在冷却中的账号。
+		}
 		return p.pickEarliestExpiryLocked(tried, now, realm, reqModel)
 	}
 	// top5 短名单按权重降序截断（而非 credits 单纯降序）：否则闲置补偿根本进不了
@@ -157,6 +170,20 @@ func (p *Pool) pick(tried map[string]bool, reqModel, realm string) *auth.Auth {
 			ws = append(ws, weighted{e: e, w: p.routingWeightOf(e, maxCredits, now), tier: ti, cost1k: ci})
 		}
 	}
+	if strategy := p.strategyForRealmLocked(realm); strategy != WeightedRandom {
+		ordered := make([]*entry, 0, len(ws))
+		for _, w := range ws {
+			ordered = append(ordered, w.e)
+		}
+		e := p.pickOrderedLocked(ordered, tried, reqModel, realm, strategy, explored, now)
+		e.lastUsed = now
+		p.pickSeq++
+		e.usedSeq = p.pickSeq
+		if explored {
+			log.Printf("[pool] cost explore model=%s realm=%q acct=%s window=%s", reqModel, realm, logfmt.Label(e.a.UID, e.a.Nickname), p.costExploreInterval)
+		}
+		return e.a
+	}
 	// 等权重洗牌：仅当存在权重相等且候选数超过 top5 时，才对 ws 做 Fisher-Yates
 	// 洗牌（且**不消耗 p.randInt64N 注入源**，避免改变 pickWeighted 的确定性语义，
 	// 见 TestPickDeterministicViaSetRandomSource）。权重全等或存在并列时，按字典序
@@ -231,7 +258,7 @@ func (p *Pool) pick(tried map[string]bool, reqModel, realm string) *auth.Auth {
 	}
 	e.lastUsed = now // 锁内即时标记：下一个进入 pick 的 goroutine 立即看到本号已用
 	p.pickSeq++
-	e.usedSeq = p.pickSeq // 单调序号：保证 usedSeq 严格全序（防惊群/LRU 的权威依据）
+	e.usedSeq = p.pickSeq  // 单调序号：保证 usedSeq 严格全序（防惊群/LRU 的权威依据）
 	notePickLocked(e, now) // 选中打点：窗口内被选次数参与下一轮负载惩罚
 	return e.a
 }

@@ -89,6 +89,8 @@ func newTransport() *http.Transport {
 		MaxIdleConnsPerHost:   maxIdleConnsPerHost,
 		IdleConnTimeout:       idleConnTimeout,
 		ResponseHeaderTimeout: responseHeaderTimeout,
+		// 自动读取环境变量中的代理配置
+		Proxy: http.ProxyFromEnvironment,
 	}
 }
 
@@ -111,6 +113,10 @@ func newTransportWithFingerprint(proxyURL *url.URL) (*http.Transport, error) {
 		return nil, err
 	}
 	tr := newTransport()
+	// 指纹路径显式置空代理：上游 PR #223 后 newTransport() 默认带
+	// ProxyFromEnvironment，而标准库只对「非代理 https」调用 DialTLSContext——
+	// 不置 nil 会让指纹握手被环境代理隧道绕过（tlsfp_wiring_test 锁此语义）。
+	tr.Proxy = nil
 	tr.DialTLSContext = dial
 	return tr, nil
 }

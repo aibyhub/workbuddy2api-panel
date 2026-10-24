@@ -61,6 +61,11 @@ type Config struct {
 	// 待办并执行，与面板「执行全部待办」按钮同管线）。调度器只管时点不管实现——
 	// panel 在 scheduler 之后构造，用 SetGrowthHook 事后挂载；nil 时到点跳过。
 	GrowthHook func()
+
+	// TaskSweepHook 任务补领清扫回调（panel.RunTaskSweepOnce：把「已达标未领」
+	// 的任务奖励领掉，不跑任何行为链路）。与 GrowthHook 同款延迟挂载；nil 时
+	// ticker 到点跳过。见 issue #174：成长队列与「一键完成」都不负责这条补领链路。
+	TaskSweepHook func()
 }
 
 // Scheduler 调度器。
@@ -80,11 +85,12 @@ type Scheduler struct {
 	balanceState map[string]balanceFailState
 
 	// schedMu 保护排程参数（时点/开关）；Reconfigure 可在运行期热改（面板保存配置时调用）。
-	// rearmSchedule/rearmBalance 是「排程已变，立即重算」通知：Run 与余额刷新循环各自消费，
-	// 分别用独立 channel（同 channel 被两个 select 消费会丢信号）。
+	// rearmSchedule/rearmBalance/rearmSweep 是「排程已变，立即重算」通知：Run 与
+	// 各周期循环各自消费，分别用独立 channel（同 channel 被多个 select 消费会丢信号）。
 	schedMu       sync.Mutex
 	rearmSchedule chan struct{}
 	rearmBalance  chan struct{}
+	rearmSweep    chan struct{}
 
 	// balanceInterval 余额刷新间隔（纳秒，0=暂停）。atomic 读写：执行循环每轮读当前值，
 	// SetBalanceInterval 可任意时刻热改（面板保存配置）。
@@ -94,6 +100,15 @@ type Scheduler struct {
 	// 替代 time.Sleep，优雅停机不必等睡满。Run 未启动（面板先于排程手动触发/测试）
 	// 时回落 context.Background()，行为与 time.Sleep 一致。
 	runCtx atomic.Value // context.Context
+
+	// sweepInterval 任务补领清扫间隔（纳秒，0=暂停）。语义同 balanceInterval：
+	// SetTaskSweepInterval 可热改（面板保存配置后下一轮生效）。
+	sweepInterval atomic.Int64
+
+	// lastBalanceRefresh 最近一次后台余额刷新的完成时刻（Unix 纳秒，0=尚未跑过）。
+	// 供面板「到期提醒」标注数据年龄：卡片展示的是这份快照，必须让年龄可读，
+	// 否则界面 5 秒轮询会让人误以为数据也是 5 秒级新鲜。
+	lastBalanceRefresh atomic.Int64
 }
 
 // balanceFailState 单账号余额刷新连败状态（仅后台周期路径消费，手动刷新只记不跳）。
@@ -133,6 +148,7 @@ func New(cfg Config) *Scheduler {
 		balanceState:  make(map[string]balanceFailState),
 		rearmSchedule: make(chan struct{}, 1),
 		rearmBalance:  make(chan struct{}, 1),
+		rearmSweep:    make(chan struct{}, 1),
 	}
 }
 
@@ -557,14 +573,22 @@ func (s *Scheduler) checkinAccount(a *auth.Auth, uid, nickname string, expiringS
 			log.Printf("checkin %s: 签到成功", logfmt.Label(uid, nickname))
 		}
 	}
-	// 分桶查余额：配置窗口内的积分单独标记，同时记录最早未来到期批次。
-	remain, total, expiring, earliestAt, earliestRemaining, err := s.cfg.Upstream.UserResourceDetailedWithExpiry(a, expiringSoon)
+	// 分桶查余额：配置窗口内的积分单独标记，同时记录最早未来到期批次与
+	// 按自然日聚合的全部批次（首页快照与「检查」共用同一口径）。
+	remain, total, expiring, earliestAt, earliestRemaining, buckets, err := s.cfg.Upstream.UserResourceSnapshot(a, expiringSoon)
 	if err != nil {
 		log.Printf("user-resource %s: %v", logfmt.Label(uid, nickname), err)
 		return
 	}
 	s.cfg.Pool.ReenableIfCredits(uid, remain, total)
-	s.cfg.Pool.SetCreditsDetailed(uid, remain, total, expiring, earliestAt, earliestRemaining)
+	s.cfg.Pool.SetCreditsSnapshot(uid, pool.CreditsSnapshot{
+		Remain:            remain,
+		Total:             total,
+		Expiring:          expiring,
+		EarliestAt:        earliestAt,
+		EarliestRemaining: earliestRemaining,
+		ExpiryBuckets:     poolExpiryBuckets(buckets),
+	})
 }
 
 // RunActivityNow 立即对池内所有可用账号执行一次对话活跃上报。
@@ -596,7 +620,9 @@ func (s *Scheduler) runActivity(ctx context.Context) {
 		// 点亮 growth 连登天数 / 解锁 first_buddy 领养——这两者对企业号都是 403
 		// （「growth system is only available for personal users」），即**零收益**。
 		// 该类"静默无效"最易被忽略（日志无异常），故显式跳过，不给上游多发一次请求。
-		if a.IsEnterprise() {
+		// 企业切换会话（token_source=enterprise_switch）同跳：report 返回 200 却被
+		// 上游静默丢弃（连登不涨），同样是零收益（见 auth.IsEnterpriseSession）。
+		if a.IsEnterpriseSession() {
 			continue
 		}
 		// global 账号同样上报（PR #45 实测国际版 /v2/report 在 workbuddy.ai 上 code=0 OK，
@@ -678,9 +704,21 @@ func (s *Scheduler) RunKeepaliveNow() {
 	}
 }
 
+// poolExpiryBuckets 把 upstream 的按日到期批次转换为 pool 结构。两个包字段同构，
+// 手工转换是为了不让底层 pool 反向依赖 upstream。
+func poolExpiryBuckets(in []upstream.ExpiryBucket) []pool.ExpiryBucket {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make([]pool.ExpiryBucket, len(in))
+	for i, b := range in {
+		out[i] = pool.ExpiryBucket{Date: b.Date, ExpireAt: b.ExpireAt, Remain: b.Remain}
+	}
+	return out
+}
+
 // RunBalanceRefreshNow 并发查询余额并更新池内 credits（全库同时发车，供面板手动
-// 全量刷新——人为动作追求立即可见，不做错峰与连败跳过；只记退避计数）。
-// 账号范围：默认跳过禁用账号；schedule.include_disabled_in_tasks 打开时一并刷新
+// 全量刷新——人为动作追求立即可见，不做错峰与连败跳过；只记退避计数）。// 账号范围：默认跳过禁用账号；schedule.include_disabled_in_tasks 打开时一并刷新
 // （轮换用法下据此判断下一个该启用谁）。注意 ReenableIfCredits 对 disabled 是
 // no-op，所以本开关**不会**导致禁用号被自动解冻——它只让已有账号的积分保持新鲜。
 // 解冻语义与签到一致（ReenableIfCredits：余额 > 0 的冷却账号自动解冻），
@@ -703,13 +741,16 @@ func (s *Scheduler) RunBalanceRefreshNow() {
 		}(a, st.UID)
 	}
 	wg.Wait()
+	// 手动全量刷新同样落「最近刷新时刻」：面板「到期提醒」的数据年龄标注以
+	// 本快照为准，手动刷新后必须即时变新（上游 lastBalanceRefresh 语义）。
+	s.lastBalanceRefresh.Store(time.Now().UnixNano())
 }
 
 // refreshOneBalance 刷新单账号余额：查上游（内含 3 次瞬时有界重试）→ 回写池内
 // credits/到期批次 → 解冻语义 → 连败/成功按 uid 记退避状态。interval>0 时连败
 // ≥3 会写入 skipUntil 供 RunBalanceRefreshStaggered 跳过；=0（手动路径）只计数。
 func (s *Scheduler) refreshOneBalance(a *auth.Auth, uid string, interval time.Duration) {
-	remain, total, expiring, earliestAt, earliestRemaining, err := s.cfg.Upstream.UserResourceDetailedWithExpiry(a, s.ExpiringSoonWindow())
+	remain, total, expiring, earliestAt, earliestRemaining, buckets, err := s.cfg.Upstream.UserResourceSnapshot(a, s.ExpiringSoonWindow())
 	if err != nil {
 		log.Printf("balance %s: %v", logfmt.Label(uid, a.Nickname), err)
 		s.balanceRecordFail(uid, interval)
@@ -717,7 +758,14 @@ func (s *Scheduler) refreshOneBalance(a *auth.Auth, uid string, interval time.Du
 	}
 	s.balanceRecordOk(uid)
 	s.cfg.Pool.ReenableIfCredits(uid, remain, total)
-	s.cfg.Pool.SetCreditsDetailed(uid, remain, total, expiring, earliestAt, earliestRemaining)
+	s.cfg.Pool.SetCreditsSnapshot(uid, pool.CreditsSnapshot{
+		Remain:            remain,
+		Total:             total,
+		Expiring:          expiring,
+		EarliestAt:        earliestAt,
+		EarliestRemaining: earliestRemaining,
+		ExpiryBuckets:     poolExpiryBuckets(buckets),
+	})
 }
 
 // balanceStaggerSpread 后台错峰的总摊开时长：interval/3，上限 90s（interval 极小时
@@ -788,10 +836,10 @@ func (s *Scheduler) balanceRecordFail(uid string, interval time.Duration) {
 
 // RunBalanceRefreshStaggered 后台周期刷新专用：错峰启动 + 连败退避跳过。
 // 手动全量刷新仍走 RunBalanceRefreshNow（全库齐刷、无跳过）。
-//  - 错峰：每账号按 uid 稳定偏移 <spread> 启动（5m 周期摊 90s），避免 7 个并发
-//    TLS 握手在同 500ms 撞进上游抖动窗口——EOF 风暴是窗口内级联放大出来的；
-//  - 连败退避：≥3 次连续失败（重试尽出仍失败）跳过 0.5~2×interval 轮，抖动窗口
-//    内不再对着同一个号推磨；成功一次整体清零。禁用/暂停过滤与 RunBalanceRefreshNow 同规。
+//   - 错峰：每账号按 uid 稳定偏移 <spread> 启动（5m 周期摊 90s），避免 7 个并发
+//     TLS 握手在同 500ms 撞进上游抖动窗口——EOF 风暴是窗口内级联放大出来的；
+//   - 连败退避：≥3 次连续失败（重试尽出仍失败）跳过 0.5~2×interval 轮，抖动窗口
+//     内不再对着同一个号推磨；成功一次整体清零。禁用/暂停过滤与 RunBalanceRefreshNow 同规。
 //
 // 为什么不做随机偏移：uid 哈希偏移每轮固定，行为可复盘（同 uid 总在同一相对时点刷新），
 // 也天然避开「每轮全库同毫秒齐刷」这个和上游限流/抖动互相纠缠的模式。
@@ -826,6 +874,7 @@ func (s *Scheduler) RunBalanceRefreshStaggered(ctx context.Context, interval tim
 		}(a, st.UID)
 	}
 	wg.Wait()
+	s.lastBalanceRefresh.Store(time.Now().UnixNano())
 }
 
 // StartBalanceRefresh 后台周期性余额刷新（独立 ticker goroutine，ctx 取消即停）。
@@ -839,6 +888,10 @@ func (s *Scheduler) StartBalanceRefresh(ctx context.Context, interval time.Durat
 	}
 	s.balanceInterval.Store(int64(interval))
 	go func() {
+		// 启动即刷一轮：进程重启（含升级到带按日批次的版本）后旧 state 可能没有
+		// credits_expiry_buckets；不等第一个 ticker，首页快照就能拿到与「检查」
+		// 同口径的完整数据，避免升级后前 5 分钟仍显示旧口径。
+		s.RunBalanceRefreshNow()
 		var logged time.Duration
 		for {
 			cur := time.Duration(s.balanceInterval.Load())
@@ -869,6 +922,80 @@ func (s *Scheduler) StartBalanceRefresh(ctx context.Context, interval time.Durat
 	}()
 }
 
+// StartTaskSweep 后台周期性任务补领清扫（独立 ticker goroutine，ctx 取消即停）。
+// 与 StartBalanceRefresh 同款结构；interval<=0 不启动（面板关闭开关时 main 不
+// 调用即可），运行期可用 SetTaskSweepInterval 热改间隔（下一轮生效）。
+//
+// 与成长队列（GrowthHook，小时制）的区别：队列执行的是**行为链路**（真实对话、
+// 事件上报）成本高；清扫只做 accept/claim 两条幂等读改请求，分钟级跑也几乎零
+// 负担，却能补上「达标的任务没人领奖」这条长期缺失的链路（issue #174）。
+func (s *Scheduler) StartTaskSweep(ctx context.Context, interval time.Duration) {
+	if interval <= 0 {
+		return
+	}
+	s.sweepInterval.Store(int64(interval))
+	go func() {
+		var logged time.Duration
+		for {
+			cur := time.Duration(s.sweepInterval.Load())
+			if cur != logged {
+				log.Printf("scheduler: 任务补领清扫每 %s（暂停中显示 0s）", cur)
+				logged = cur
+			}
+			if cur <= 0 {
+				// 被热改暂停：等重排通知（重新启用时唤醒）或退出。
+				select {
+				case <-ctx.Done():
+					return
+				case <-s.rearmSweep:
+					continue
+				}
+			}
+			timer := time.NewTimer(cur)
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				return
+			case <-s.rearmSweep:
+				timer.Stop() // 间隔已变：立刻按新值重算
+			case <-timer.C:
+				s.schedMu.Lock()
+				hook := s.cfg.TaskSweepHook
+				s.schedMu.Unlock()
+				if hook != nil {
+					hook()
+				}
+			}
+		}
+	}()
+}
+
+// RunTaskSweepNow 立刻跑一轮任务补领清扫（手动触发/测试用）。
+func (s *Scheduler) RunTaskSweepNow() {
+	s.schedMu.Lock()
+	hook := s.cfg.TaskSweepHook
+	s.schedMu.Unlock()
+	if hook != nil {
+		hook()
+	}
+}
+
+// SetTaskSweepHook 挂载/替换任务补领清扫回调（panel 构造晚于 scheduler，事后接线）。
+func (s *Scheduler) SetTaskSweepHook(fn func()) {
+	s.schedMu.Lock()
+	s.cfg.TaskSweepHook = fn
+	s.schedMu.Unlock()
+}
+
+// SetTaskSweepInterval 热改任务补领清扫间隔；<=0 表示暂停循环（面板关闭该开关时）。
+func (s *Scheduler) SetTaskSweepInterval(d time.Duration) {
+	if d < 0 {
+		d = 0
+	}
+	s.sweepInterval.Store(int64(d))
+	poke(s.rearmSweep)
+}
+
 // SetBalanceInterval 热改余额刷新间隔；<=0 表示暂停循环（面板关闭该开关时）。
 func (s *Scheduler) SetBalanceInterval(d time.Duration) {
 	if d < 0 {
@@ -876,4 +1003,18 @@ func (s *Scheduler) SetBalanceInterval(d time.Duration) {
 	}
 	s.balanceInterval.Store(int64(d))
 	poke(s.rearmBalance)
+}
+
+// BalanceInterval 当前余额后台刷新间隔（0=暂停）。面板 overview 据此告诉用户
+// 「到期提醒」卡片的数据节奏，而不是让 5 秒界面轮询冒充数据新鲜度。
+func (s *Scheduler) BalanceInterval() time.Duration {
+	return time.Duration(s.balanceInterval.Load())
+}
+
+// BalanceRefreshedAt 最近一次后台余额刷新的完成时刻（零值 = 尚未跑过）。
+func (s *Scheduler) BalanceRefreshedAt() time.Time {
+	if v := s.lastBalanceRefresh.Load(); v != 0 {
+		return time.Unix(0, v)
+	}
+	return time.Time{}
 }
