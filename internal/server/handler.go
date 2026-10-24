@@ -606,7 +606,9 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	// realm 前缀解析（D6）：model 名可能带 "[realm:]" 前缀。剥出 realm + bareModel，
 	// bareModel 用于选号/粘性/出站 body 重写（前缀是网关侧路由协议，上游只认裸名）。
 	// 裸名 → ("cn", 原串)，CN 现状零回归。
-	realm, bareModel, realmExplicit := resolveModelDetail(peek.Model)
+	// realmExplicit（裸名=false）在 fork 语义里由 realmChain 内部判定显式前缀，
+	// handler 侧不再单独消费，显式弃用第三返回值。
+	realm, bareModel, _ := resolveModelDetail(peek.Model)
 	// 跨域兜底序列（aibyhub.7）：裸名请求 → [主域, 兜底域]；显式前缀 → 严格单域。
 	// 兜底域由 cross_realm_fallback(缺省 1)+fallback_realm(缺省 global) 驱动；
 	// 下方 crossRealm(#135) 门控与之并存：链兜底决定可选域集合，命中他域账号后
@@ -635,11 +637,8 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	if h.cfg.Upstream != nil {
 		modelRate = h.cfg.Upstream.ModelRate(realm, bareModel)
 	}
-	// 跨域回退（issue #135）：只有裸模型名 + 显式开启 pool.cross_domain_fallback 时生效。
-	// 语义 = 「裸名不绑定单一域」：首选域（裸名默认 cn）选不到可用号（账号级冷却/熔断/
-	// 在途占满，或该域账号对这个模型 11102 后进入模型级负缓存）时，改用另一域再选一次；
-	// 显式 cn:/global: 前缀保持原语义，永不回退。
-	crossRealm := !realmExplicit && h.cfg.Pool.CrossDomainFallback()
+	// （上游 #135 的 crossRealm 变量已并入上方 fallbackRealm 双开关门控：
+	// 域选择见 realmChain 分级兜底；命中他域账号后按实际域重算倍率，见选号循环尾。）
 
 	// 请求级统计：出口即打一行表格日志（任何路径都会走到）。
 	st := newChatStat(time.Now(), body, peek.Stream)
@@ -934,7 +933,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		st.uid = acct.UID
 		// 同步昵称：请求流水行只写 uid8 时无法直观看是哪一号，昵称随本次选号带入日志行。
 		st.nick = acct.Nickname
-		if crossRealm && h.cfg.Upstream != nil && acct.Realm() != realm {
+		if h.cfg.Upstream != nil && acct.Realm() != realm {
 			// 跨域回退命中：按实际服务域取积分倍率，用量/账本记的是真实域口径，
 			// 而不是请求前缀声明的域。
 			modelRate = h.cfg.Upstream.ModelRate(acct.Realm(), bareModel)

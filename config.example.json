@@ -48,6 +48,8 @@
     "keepalive_enabled": true,
     "blackcat_enabled": true,
     "balance_refresh_enabled": true,
+    "task_sweep_enabled": true,
+    "task_sweep_minutes": 15,
     "balance_refresh_minutes": 5,
     "include_disabled_in_tasks": false
   },

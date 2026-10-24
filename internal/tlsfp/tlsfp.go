@@ -9,9 +9,10 @@
 // 敏感的，凭记忆改动 = 指纹漂移 = 伪装失效。
 //
 // 形态摘要（Node 无-ALPN 档，标准 JA3 见 WorkBuddyJA3String）：
-//   TLS 1.3（supported_versions [1.3,1.2]）、18 个 cipher（1301/1302/1303 打头）、
-//   10 个扩展（SNI/EMS/renego/groups/points/ticket/sigalgs/key_share/psk_modes/
-//   supported_versions）、曲线 x25519-p256-p384、无 ALPN（即 HTTP/1.1）、无 GREASE。
+//
+//	TLS 1.3（supported_versions [1.3,1.2]）、18 个 cipher（1301/1302/1303 打头）、
+//	10 个扩展（SNI/EMS/renego/groups/points/ticket/sigalgs/key_share/psk_modes/
+//	supported_versions）、曲线 x25519-p256-p384、无 ALPN（即 HTTP/1.1）、无 GREASE。
 package tlsfp
 
 import (
@@ -25,8 +26,8 @@ import (
 	"strings"
 	"time"
 
-	"golang.org/x/net/proxy"
 	utls "github.com/refraction-networking/utls"
+	"golang.org/x/net/proxy"
 )
 
 // HandshakeTimeout tlsfp 握手硬上限。自定义 DialTLSContext 生效后标准库的
