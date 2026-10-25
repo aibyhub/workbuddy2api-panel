@@ -141,7 +141,9 @@ func TestDeviceTokenFromConfigOrFile_Overrides(t *testing.T) {
 func TestDeviceTokenFileTooLarge(t *testing.T) {
 	dir := t.TempDir()
 	fp := filepath.Join(dir, "device_token")
-	if err := os.WriteFile(fp, []byte(strings.Repeat("x", 2048)), 0o600); err != nil {
+	// 5000 字节 > 上限 4096（Turing v3 令牌实测 1070 字符，上限放宽后旧的 2KB
+	// 夹具落在合法区间内，改用超限夹具锁「过大拒绝」语义）。
+	if err := os.WriteFile(fp, []byte(strings.Repeat("x", 5000)), 0o600); err != nil {
 		t.Fatalf("write file: %v", err)
 	}
 	save := resetDeviceTokenFileCache(fp)
@@ -150,6 +152,26 @@ func TestDeviceTokenFileTooLarge(t *testing.T) {
 	c := &Client{DeviceTokenFile: fp}
 	if tok := c.resolveDeviceToken(a); tok != "" {
 		t.Errorf("resolveDeviceToken() = %q want empty (file too large)", tok)
+	}
+}
+
+// TestReadDeviceTokenFileV3Length 回归：Turing v3 令牌实测 1070 字符（2026-10-25
+// extract_turing_token.mjs 从本机客户端 SDK 铸出），旧 1KB 上限会静默拒掉真令牌——
+// 4KB 上限必须放行完整令牌（含尾随换行被 trim）。
+func TestReadDeviceTokenFileV3Length(t *testing.T) {
+	dir := t.TempDir()
+	v3 := "v3:AbCdEf" + strings.Repeat("x", 1062) + "9z01" // 合计 1075 字符
+	if len(v3) != 1075 {
+		t.Fatalf("fixture length=%d want 1075", len(v3))
+	}
+	fp := filepath.Join(dir, "device_token")
+	if err := os.WriteFile(fp, []byte(v3+"\n"), 0o600); err != nil {
+		t.Fatalf("write file: %v", err)
+	}
+	save := resetDeviceTokenFileCache(fp)
+	defer save()
+	if got := readDeviceTokenFile(fp); got != v3 {
+		t.Fatalf("v3 token rejected: len(got)=%d want %d", len(got), len(v3))
 	}
 }
 

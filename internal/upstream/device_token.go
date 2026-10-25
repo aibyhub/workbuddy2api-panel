@@ -2,8 +2,10 @@
 //
 // 容器内无桌面端 Turing Shield SDK，无法像 Python fork（xiaofan6ya/converter.py）那样
 // 现取 token。这里提供另一条路径：宿主把桌面端生成的 device token 落 /app/data/device_token
-// （或任意挂载路径），网关定期读取注入。读取频率限 5 分钟一次缓存，>1KB 或读失败则忽略
+// （或任意挂载路径），网关定期读取注入。读取频率限 5 分钟一次缓存，超限或读失败则忽略
 // （优雅降级不注入，不影响主流程）。
+// 2026-10-25 实测：Turing v3 令牌 1070 字符（scripts/extract_turing_token.mjs 从本机
+// 客户端 SDK 铸出），原 1KB 上限会把真令牌静默拒掉——上限放宽到 4KB。
 package upstream
 
 import (
@@ -20,9 +22,9 @@ var errDeviceTokenTooLarge = errors.New("device token file too large")
 // 避免每次出站请求都 stat+read 文件。
 const deviceTokenFileTTL = 5 * time.Minute
 
-// deviceTokenFileMaxLen token 文件最大字节数。token 通常几百字节；超过 1KB
-// 视为异常（非 token 内容 / 文件被误用），忽略不注入。
-const deviceTokenFileMaxLen = 1024
+// deviceTokenFileMaxLen token 文件最大字节数。Turing v3 令牌实测 1070 字符，
+// 留足演进余量取 4KB；超过视为异常（非 token 内容 / 文件被误用），忽略不注入。
+const deviceTokenFileMaxLen = 4096
 
 // deviceTokenFileCache 缓存 device token 文件读取结果（path → token+读取时刻）。
 type deviceTokenFileCache struct {
@@ -43,7 +45,7 @@ func readDeviceTokenFile(path string) string {
 	}
 	// 快路径：缓存命中且未过期，直接返回缓存值。注意全程持锁（defer Unlock）——
 	// 含 5 分钟一次的过期重读（锁内读文件）。调用频率极低（每 5min 最多一次
-	// 文件 IO，文件上限 1KB），锁内 IO 可接受；若未来出现 NFS 挂载 + 高并发的
+	// 文件 IO，文件上限 4KB），锁内 IO 可接受；若未来出现 NFS 挂载 + 高并发的
 	// 部署形态，再上 singleflight 包住重读段（YAGNI，现在不做）。
 	dtFileCache.mu.Lock()
 	defer dtFileCache.mu.Unlock()
