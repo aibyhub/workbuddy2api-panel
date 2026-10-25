@@ -180,6 +180,12 @@ type Config struct {
 		DeviceToken string `json:"device_token"`
 		// DeviceTokenFile device token 文件路径兜底（宿主落盘的桌面端 token，5 分钟读取缓存）。
 		DeviceTokenFile string `json:"device_token_file"`
+		// Qimei36 腾讯 qimei 设备指纹（36 hex）：/v2/report 事件 qimei36 字段来源。
+		// 空 = 回落 qimei_file > 内置派生（每实例恒定一台「虚拟设备」）。真实值可取自
+		// 本机客户端 ~/.workbuddy/qimei-cache.json 的 qimei36 键。
+		Qimei36 string `json:"qimei36"`
+		// QimeiFile qimei36 文件兜底（可放 qimei-cache.json 原文或纯 36 hex，5 分钟读取缓存）。
+		QimeiFile string `json:"qimei_file"`
 		// PassthroughIP 是否透传客户端 IP 给上游（默认 false，反代安全边界）。
 		PassthroughIP bool `json:"passthrough_ip"`
 		// ProxyURL 全局兜底出口代理（http/https/socks5/socks5h）。优先级：
@@ -493,6 +499,12 @@ func applyEnv(c *Config) {
 	}
 	if v := os.Getenv("WB2A_DEVICE_TOKEN_FILE"); v != "" {
 		c.Upstream.DeviceTokenFile = v
+	}
+	if v := os.Getenv("WB2A_QIMEI36"); v != "" {
+		c.Upstream.Qimei36 = v
+	}
+	if v := os.Getenv("WB2A_QIMEI_FILE"); v != "" {
+		c.Upstream.QimeiFile = v
 	}
 	if v := os.Getenv("WB2A_PASSTHROUGH_IP"); v != "" {
 		if b, err := strconv.ParseBool(v); err == nil {

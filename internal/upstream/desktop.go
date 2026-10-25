@@ -1,4 +1,4 @@
-// desktop.go 桌面客户端（WorkBuddy Desktop 5.5.6）行为指纹上报。
+// desktop.go 桌面客户端（WorkBuddy Desktop，版本常量见 desktopUA/desktopFingerprint）行为指纹上报。
 //
 // 来源：2026-09-12 Sunny 抓包实测（data/desktop-task-protocol.md）。桌面端点亮
 // 「需电脑端」类任务的关键不是独立端点，而是同一 POST /v2/report 通道上
@@ -39,8 +39,9 @@ import (
 const (
 	desktopReportPath    = "/v2/report"
 	desktopAppearanceSet = "/v2/user-asset/appearance/set"
-	// desktopUA 实测桌面客户端 UA（5.5.6 内嵌 CLI 2.137.1）。
-	desktopUA = "WorkBuddy/5.5.6 WorkBuddy/5.5.6 CLI/2.137.1"
+	// desktopUA 实测桌面客户端 UA（2026-10-25 对照本机客户端真实 UA 更新：
+	// 5.8.3 内嵌 CLI 2.161.0；客户端自动更新后此处需同步）。
+	desktopUA = "WorkBuddy/5.8.3 WorkBuddy/5.8.3 CLI/2.161.0"
 )
 
 // desktopBase 桌面端 /v2/report 与 user-asset 走 chatBase（copilot.tencent.com）。
@@ -57,24 +58,26 @@ func deriveID(a *auth.Auth, salt string) string {
 type DesktopEvent map[string]any
 
 // desktopFingerprint 公共桌面指纹字段（注入每个事件，覆盖同名业务键）。
-func desktopFingerprint(a *auth.Auth) map[string]any {
+// 版本族常量对照本机客户端 5.8.3 实测（last-launch.json build SHA / asar 落盘时间）。
+func desktopFingerprint(a *auth.Auth, qimei36 string) map[string]any {
 	now := time.Now().UnixMilli()
 	return map[string]any{
 		"timezone":     "Asia/Shanghai",
-		"reportDelay":  2000,
+		"reportDelay":  0, // 客户端 StandardEventService 事件字面量 reportDelay:0（合批延迟由批量层承担）
 		"userId":       a.UID,
 		"username":     a.Nickname,
 		"userNickname": a.Nickname,
 		"product":      "SaaS",
-		"releaseDate":  int64(1789036585355),
-		"commit":       "5f9692923c93033111c51ad7b003eb80204a9b75",
+		"releaseDate":  int64(1792029840000),                       // 5.8.3 分发包构建时刻（对照本机 asar 落盘 2026-10-15 10:04 +0800）
+		"commit":       "db0e9b51b7fa0b383f41f5b0b83dd442c8557918", // 5.8.3 构建 SHA（last-launch.json 实测，40 hex）
 		"ideName":      "WorkBuddy",
 		"ideType":      "WorkBuddy",
-		"ideVersion":   "5.5.6",
+		"ideVersion":   "5.8.3",
 		"machineId":    deriveID(a, "machine"),
 		"sessionId":    deriveID(a, "session"),
 		"extName":      "workbuddy-desktop",
-		"extVersion":   "5.5.6",
+		"extVersion":   "5.8.3",
+		"qimei36":      qimei36, // 客户端 QimeiEventProcessor 给每条 /v2/report 事件补的设备指纹
 		"os":           "win32",
 		"arch":         "x64",
 		"osVersion":    "10.0.26220",
@@ -92,7 +95,7 @@ func (c *Client) ReportDesktopEvent(a *auth.Auth, events ...DesktopEvent) error 
 	if len(events) == 0 {
 		return fmt.Errorf("desktop report: no events")
 	}
-	fp := desktopFingerprint(a)
+	fp := desktopFingerprint(a, c.resolveQimei36())
 	arr := make([]map[string]any, 0, len(events))
 	for _, ev := range events {
 		m := map[string]any{}

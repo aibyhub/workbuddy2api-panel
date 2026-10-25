@@ -775,6 +775,11 @@ type Client struct {
 	// DeviceTokenFile 设备 token 文件路径兜底（宿主落盘的桌面端 token，5 分钟读取缓存）。
 	DeviceTokenFile string
 
+	// Qimei36 / QimeiFile 腾讯 qimei 设备指纹（/v2/report 事件 qimei36 字段来源）。
+	// 解析优先级见 resolveQimei36（qimei.go）：config 值 > 文件 > 内置派生常量。
+	Qimei36   string
+	QimeiFile string
+
 	ChatBaseCN    string
 	BillingBaseCN string
 	// WebBaseCN 官网（workbuddy.cn）域：部分「任务领奖」类接口只在此域提供
@@ -2497,10 +2502,15 @@ func (c *Client) DailyCheckin(a *auth.Auth) error {
 // IsAlreadyCheckin 报告 err 是否表示"今天已签到"（上游幂等拒绝重复签到）。
 // 只认带分类的 *Error（业务 code 或 HTTP 错误）：网络层/解析层错误不得当作幂等成功，
 // 否则停机补签遇到抖动会误记为 already，账号当天实际未签到却被判定正常。
+// 业务码 1001（客户端 mapCheckinStatus 语义 = AlreadyClaimed）精确匹配信封 JSON
+// （前后非数字边界，避免 11001/21001 子串误判）。
 func IsAlreadyCheckin(err error) bool {
 	var ue *Error
 	if !errors.As(err, &ue) {
 		return false
+	}
+	if claimedCodeRe.MatchString(ue.Msg) {
+		return true
 	}
 	for _, m := range alreadyCheckinMarkers {
 		if strings.Contains(ue.Msg, m) || strings.Contains(strings.ToLower(ue.Msg), strings.ToLower(m)) {
@@ -2508,6 +2518,52 @@ func IsAlreadyCheckin(err error) bool {
 		}
 	}
 	return false
+}
+
+// claimedCodeRe 匹配业务码 1001（AlreadyClaimed）的两种 Msg 形态：
+// JSON 信封 `"code":1001`（部分错误路径透传原文）与文本形态 `code=1001 msg=…`
+// （billingJSON 分类路径）。Go regexp（RE2）无负向断言，用 ([^0-9]|$) 排除
+// 11001/21001/10012 等更长数码的前缀子串（1001 后必须是非数字或串尾）。
+var claimedCodeRe = regexp.MustCompile(`(?:"code"\s*:\s*|code=)1001([^0-9]|$)`)
+
+// checkinActivityStatusPath 签到活动状态查询（客户端 UI 打开时先查它：
+// today_checked_in 权威判已签、streak_days/checkin_dates 承载连续签到与日历）。
+const checkinActivityStatusPath = "/v2/billing/meter/checkin-activity-status"
+
+// CheckinActivity 签到活动状态（与客户端 checkinStatus() 解析同构）。
+type CheckinActivity struct {
+	Active            bool     `json:"active"`
+	TodayCheckedIn    bool     `json:"today_checked_in"`
+	StreakDays        int      `json:"streak_days"`
+	DailyCredit       int64    `json:"daily_credit"`
+	TodayCredit       int64    `json:"today_credit"`
+	IsStreakDay       bool     `json:"is_streak_day"`
+	NextStreakDay     int      `json:"next_streak_day"`
+	StreakBonusDays   int      `json:"streak_bonus_days"`
+	StreakBonusCredit int64    `json:"streak_bonus_credit"`
+	CheckinDates      []string `json:"checkin_dates"`
+	TotalCredits      int64    `json:"total_credits"`
+}
+
+// CheckinActivityStatus 查询签到活动状态（CN 域；global/企业账号由调用方门控跳过）。
+// 查询本身撞上业务码 1001（已领取）时按「今日已签」返回权威结果。
+func (c *Client) CheckinActivityStatus(a *auth.Auth) (*CheckinActivity, error) {
+	data, err := c.billingMeterJSON(a, []string{checkinActivityStatusPath}, http.MethodPost, map[string]any{})
+	if err != nil {
+		var ue *Error
+		if errors.As(err, &ue) && claimedCodeRe.MatchString(ue.Msg) {
+			return &CheckinActivity{Active: true, TodayCheckedIn: true}, nil
+		}
+		return nil, err
+	}
+	if len(data) == 0 {
+		return nil, fmt.Errorf("checkin-activity-status: empty data")
+	}
+	var act CheckinActivity
+	if err := json.Unmarshal(data, &act); err != nil {
+		return nil, fmt.Errorf("parse checkin-activity-status: %w", err)
+	}
+	return &act, nil
 }
 
 func truncate(s string, n int) string {

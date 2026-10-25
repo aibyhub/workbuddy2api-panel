@@ -557,7 +557,15 @@ func (s *Scheduler) checkinAccount(a *auth.Auth, uid, nickname string, expiringS
 	// 下方余额查询照常跑（企业额度走 get-enterprise-user-usage 口径，且是
 	// credit_floor 判定与面板额度展示的唯一数据源）。
 	if !a.IsEnterprise() {
-		if err := s.cfg.Upstream.DailyCheckin(a); err != nil {
+		// 活动状态前置（客户端两步制，2026-10-25 逆向）：today_checked_in 是
+		// 「今日已签」的权威信号，不再依赖 claim 幂等错误文案；顺带取 streak
+		// 供日志观测。查询失败（上游未开活动/接口波动）回落旧 claim 路径，零回归。
+		act, serr := s.cfg.Upstream.CheckinActivityStatus(a)
+		if serr == nil && act != nil && act.TodayCheckedIn {
+			s.cfg.Pool.NoteCheckinDone(uid)
+			log.Printf("checkin %s: 今天已签到（activity-status 权威，streak=%d 天）",
+				logfmt.Label(uid, nickname), act.StreakDays)
+		} else if err := s.cfg.Upstream.DailyCheckin(a); err != nil {
 			// "今天已签到"是幂等成功（上游对重复签到返回 code!=0），不再当失败打 error 行。
 			if upstream.IsAlreadyCheckin(err) {
 				s.cfg.Pool.NoteCheckinDone(uid)
@@ -568,9 +576,15 @@ func (s *Scheduler) checkinAccount(a *auth.Auth, uid, nickname string, expiringS
 			// 其余业务错误也继续走余额查询
 		} else {
 			// 首次签到成功此前静默——排查「签到到底跑没跑」时无迹可循（幂等行只在
-			// 重复触发时出现），成功也落一行。
+			// 重复触发时出现），成功也落一行；随后按客户端语义重拉活动状态对齐
+			// streak/今日积分（best-effort，失败不影响签到结果）。
 			s.cfg.Pool.NoteCheckinDone(uid)
-			log.Printf("checkin %s: 签到成功", logfmt.Label(uid, nickname))
+			if act2, err2 := s.cfg.Upstream.CheckinActivityStatus(a); err2 == nil && act2 != nil {
+				log.Printf("checkin %s: 签到成功（+今日 %d，streak=%d 天）",
+					logfmt.Label(uid, nickname), act2.TodayCredit, act2.StreakDays)
+			} else {
+				log.Printf("checkin %s: 签到成功", logfmt.Label(uid, nickname))
+			}
 		}
 	}
 	// 分桶查余额：配置窗口内的积分单独标记，同时记录最早未来到期批次与

@@ -14,12 +14,13 @@ import (
 
 const (
 	// defaultClientVersion 出站 WorkBuddy 客户端版本段（UA 的 `WorkBuddy/<ver>` 与
-	// 白名单头组的 X-IDE-Version）。对齐官方 WorkBuddy Desktop 分发包版本（5.5.4）。
-	// config upstream.client_version 可覆盖（空 = 内置默认）。
-	defaultClientVersion = "5.5.4"
-	// defaultCliVersion 出站 UA 中 `CLI/<ver>` 段版本。对齐官方内置 CLI（2.137.1）。
-	// config upstream.cli_version 可覆盖（空 = 内置默认）。
-	defaultCliVersion = "2.137.1"
+	// 白名单头组的 X-IDE-Version）。对齐官方 WorkBuddy Desktop 分发包版本
+	// （5.8.3；2026-10-25 对照本机客户端 ~/.workbuddy/logs 真实 UA 校准，
+	// 客户端自动更新后此处需同步）。config upstream.client_version 可覆盖。
+	defaultClientVersion = "5.8.3"
+	// defaultCliVersion 出站 UA 中 `CLI/<ver>` 段版本。对齐官方内置 CLI
+	// （@tencent-ai/codebuddy-code 2.161.0）。config upstream.cli_version 可覆盖。
+	defaultCliVersion = "2.161.0"
 
 	originRefererCN     = "https://www.codebuddy.cn"
 	originRefererGlobal = "https://www.workbuddy.ai"
@@ -232,6 +233,8 @@ func (c *Client) ChatHeaders(req *http.Request, a *auth.Auth, clientIP string, m
 	}
 	// 用量归属头：默认伪造 WorkBuddy 桌面端指纹（client_name="SaaS" 还原旧行为）。
 	c.injectAttribution(req)
+	// X-Private-Data: true（官方 VLM 网关默认头表恒发，与 X-Product 同族）。
+	req.Header.Set("X-Private-Data", "true")
 	// 客户端 IP 透传（仅 PassthroughIP=true 且本次请求带 IP）。
 	c.injectClientIP(req, clientIP)
 	// 设备风控头：auth 每号 > config 全局 > 文件兜底；空则不注入。
@@ -299,6 +302,12 @@ func (c *Client) injectConversationHeaders(req *http.Request, meta ChatMeta) {
 	req.Header.Set("X-B3-TraceId", b3Trace)
 	req.Header.Set("X-B3-SpanId", messageID[:16])
 	req.Header.Set("X-B3-Sampled", "1")
+	// W3C traceparent + b3 单头（2026-10 逆向：官方客户端 trace 头族全量——
+	// VLM 网关 applyTraceHeaders 同时发 traceparent/b3/X-B3-*/X-Trace-ID）。
+	// traceparent: 00-<32hex TraceId>-<16hex SpanId>-01；b3: <TraceId>-<SpanId>-1。
+	// 与 X-B3-* 共用同一 TraceId/SpanId，三套链路头同源可关联。
+	req.Header.Set("traceparent", "00-"+b3Trace+"-"+messageID[:16]+"-01")
+	req.Header.Set("b3", b3Trace+"-"+messageID[:16]+"-1")
 }
 
 // validTraceID 判断 B3 TraceId 是否合法：16 或 32 位 hex（大小写均可）。

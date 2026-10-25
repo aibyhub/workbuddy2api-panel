@@ -136,6 +136,7 @@ type chatRequestEvent struct {
 	AgentName             string `json:"agentName"`
 	AgentType             string `json:"agentType"`
 	UserID                string `json:"userId"`
+	Qimei36               string `json:"qimei36,omitempty"` // 客户端 QimeiEventProcessor 给每条事件补的设备指纹
 }
 
 // ReportChatActivity 向上游发送一条对话活跃上报（chat_request_send）。
@@ -196,6 +197,7 @@ func (c *Client) ReportChatActivityModel(a *auth.Auth, conversationID, requestID
 		AgentName:             "default",
 		AgentType:             "conversation",
 		UserID:                a.UID,
+		Qimei36:               c.resolveQimei36(),
 	}
 	raw, err := json.Marshal([]chatRequestEvent{ev})
 	if err != nil {
