@@ -186,6 +186,9 @@ type Config struct {
 		Qimei36 string `json:"qimei36"`
 		// QimeiFile qimei36 文件兜底（可放 qimei-cache.json 原文或纯 36 hex，5 分钟读取缓存）。
 		QimeiFile string `json:"qimei_file"`
+		// DesktopInfoFile 桌面事件硬件指纹文件（os/arch/osVersion/cpuCores/memorySize，
+		// refresh_device_trust.sh 产出真机 specs）；缺失回落内置默认。
+		DesktopInfoFile string `json:"desktop_info_file"`
 		// PassthroughIP 是否透传客户端 IP 给上游（默认 false，反代安全边界）。
 		PassthroughIP bool `json:"passthrough_ip"`
 		// ProxyURL 全局兜底出口代理（http/https/socks5/socks5h）。优先级：
@@ -505,6 +508,9 @@ func applyEnv(c *Config) {
 	}
 	if v := os.Getenv("WB2A_QIMEI_FILE"); v != "" {
 		c.Upstream.QimeiFile = v
+	}
+	if v := os.Getenv("WB2A_DESKTOP_INFO_FILE"); v != "" {
+		c.Upstream.DesktopInfoFile = v
 	}
 	if v := os.Getenv("WB2A_PASSTHROUGH_IP"); v != "" {
 		if b, err := strconv.ParseBool(v); err == nil {

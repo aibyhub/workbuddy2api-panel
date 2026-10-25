@@ -780,6 +780,11 @@ type Client struct {
 	Qimei36   string
 	QimeiFile string
 
+	// DesktopInfoFile 桌面事件硬件指纹（os/arch/osVersion/cpuCores/memorySize）
+	// 文件源：铸 Turing 令牌那台机器的真实 specs（refresh_device_trust.sh 产出），
+	// 与 qimei36/device_token 同机自洽。缺失回落内置默认（desktop_info.go）。
+	DesktopInfoFile string
+
 	ChatBaseCN    string
 	BillingBaseCN string
 	// WebBaseCN 官网（workbuddy.cn）域：部分「任务领奖」类接口只在此域提供

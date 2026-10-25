@@ -73,6 +73,7 @@
     "device_token_file": "",
     "qimei36": "",
     "qimei_file": "",
+    "desktop_info_file": "",
     "passthrough_ip": false,
     "proxy_url": "",
     "tls_fingerprint": true

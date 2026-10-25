@@ -34,14 +34,17 @@ import (
 	"time"
 
 	"github.com/linguo2625469/workbuddy2api-panel/internal/auth"
+	"github.com/linguo2625469/workbuddy2api-panel/internal/session"
 )
 
 const (
 	desktopReportPath    = "/v2/report"
 	desktopAppearanceSet = "/v2/user-asset/appearance/set"
-	// desktopUA 实测桌面客户端 UA（2026-10-25 对照本机客户端真实 UA 更新：
-	// 5.8.3 内嵌 CLI 2.161.0；客户端自动更新后此处需同步）。
-	desktopUA = "WorkBuddy/5.8.3 WorkBuddy/5.8.3 CLI/2.161.0"
+	// desktopVersion 桌面客户端版本段（UA/ideVersion/extVersion/X-IDE-Version 共用；
+	// 2026-10-25 对照本机客户端真实 UA 更新，客户端自动更新后此处需同步）。
+	desktopVersion = "5.8.3"
+	// desktopUA 实测桌面客户端 UA 形态（双段 + 内嵌 CLI）。
+	desktopUA = "WorkBuddy/" + desktopVersion + " WorkBuddy/" + desktopVersion + " CLI/2.161.0"
 )
 
 // desktopBase 桌面端 /v2/report 与 user-asset 走 chatBase（copilot.tencent.com）。
@@ -59,7 +62,7 @@ type DesktopEvent map[string]any
 
 // desktopFingerprint 公共桌面指纹字段（注入每个事件，覆盖同名业务键）。
 // 版本族常量对照本机客户端 5.8.3 实测（last-launch.json build SHA / asar 落盘时间）。
-func desktopFingerprint(a *auth.Auth, qimei36 string) map[string]any {
+func desktopFingerprint(a *auth.Auth, qimei36 string, hw desktopInfo) map[string]any {
 	now := time.Now().UnixMilli()
 	return map[string]any{
 		"timezone":     "Asia/Shanghai",
@@ -72,19 +75,21 @@ func desktopFingerprint(a *auth.Auth, qimei36 string) map[string]any {
 		"commit":       "db0e9b51b7fa0b383f41f5b0b83dd442c8557918", // 5.8.3 构建 SHA（last-launch.json 实测，40 hex）
 		"ideName":      "WorkBuddy",
 		"ideType":      "WorkBuddy",
-		"ideVersion":   "5.8.3",
+		"ideVersion":   desktopVersion,
 		"machineId":    deriveID(a, "machine"),
 		"sessionId":    deriveID(a, "session"),
 		"extName":      "workbuddy-desktop",
-		"extVersion":   "5.8.3",
+		"extVersion":   desktopVersion,
 		"qimei36":      qimei36, // 客户端 QimeiEventProcessor 给每条 /v2/report 事件补的设备指纹
-		"os":           "win32",
-		"arch":         "x64",
-		"osVersion":    "10.0.26220",
-		"cpuCores":     20,
-		"memorySize":   24,
-		"timestamp":    now,
-		"presentAt":    now,
+		// 硬件四件套来自 desktop_info 文件源（铸令牌那台机器的真实 specs，
+		// 与 qimei36/device_token 同源同机——见 desktop_info.go）；缺失回落内置默认。
+		"os":         hw.Os,
+		"arch":       hw.Arch,
+		"osVersion":  hw.OsVersion,
+		"cpuCores":   hw.CpuCores,
+		"memorySize": hw.MemoryGB,
+		"timestamp":  now,
+		"presentAt":  now,
 	}
 }
 
@@ -95,7 +100,7 @@ func (c *Client) ReportDesktopEvent(a *auth.Auth, events ...DesktopEvent) error 
 	if len(events) == 0 {
 		return fmt.Errorf("desktop report: no events")
 	}
-	fp := desktopFingerprint(a, c.resolveQimei36())
+	fp := desktopFingerprint(a, c.resolveQimei36(), c.resolveDesktopInfo())
 	arr := make([]map[string]any, 0, len(events))
 	for _, ev := range events {
 		m := map[string]any{}
@@ -121,7 +126,9 @@ func (c *Client) ReportDesktopEvent(a *auth.Auth, events ...DesktopEvent) error 
 	req.Header.Set("User-Agent", desktopUA)
 	req.Header.Set("X-Domain", c.desktopBase(a))
 	req.Header.Set("X-Product", "SaaS")
-	req.Header.Set("X-Request-ID", deriveID(a, "req")+fmt.Sprintf("%d", time.Now().UnixNano()%1e6))
+	// 客户端 X-Request-ID 恒 32 位小写 hex（每请求随机）——deriveID+纳秒尾的
+	// 混合长串是可识别的非官方形态。
+	req.Header.Set("X-Request-ID", session.NewMessageID())
 	if a.UID != "" {
 		req.Header.Set("X-User-Id", a.UID)
 	}
@@ -449,12 +456,12 @@ func (c *Client) DesktopChatWithExpert(a *auth.Auth, expertID string) (conversat
 	h.Set("X-Product", "SaaS")
 	h.Set("X-User-Id", a.UID)
 	h.Set("X-Conversation-ID", conversationID)
-	h.Set("X-Request-ID", fmt.Sprintf("%d", time.Now().UnixNano()))
+	h.Set("X-Request-ID", session.NewMessageID()) // 32hex，客户端实测形态
 	h.Set("X-Agent-Intent", "craft")
 	h.Set("X-Agent-Type", "main")
 	h.Set("X-IDE-Name", "WorkBuddy")
 	h.Set("X-IDE-Type", "WorkBuddy")
-	h.Set("X-IDE-Version", "5.5.6")
+	h.Set("X-IDE-Version", desktopVersion)
 	h.Set("x-codebuddy-request", "1")
 	if expertID != "" {
 		h.Set("X-Expert-Id", expertID)

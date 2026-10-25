@@ -35,7 +35,7 @@ import (
 // appVersion 网关版本（fork 版：面板 + 任务体系），透出到 /panel/api/overview。
 // fork 版本线 = 上游基线 -panel + fork 标识：1.13.0(上游基线) + -aibyhub.<序号>，
 // 与上游同基线时版本号不再撞车（GHCR aibyhub 命名空间下旧 1.13.0-panel 已发布过）。
-const appVersion = "1.13.0-panel-aibyhub.12"
+const appVersion = "1.13.0-panel-aibyhub.13"
 
 // usagePathFor 由 state 文件路径推出用量文件路径：同目录、文件名 usage.json。
 // 这样 config 里改 state_file 时用量数据跟着走，不需要额外配置项。
@@ -176,6 +176,7 @@ func main() {
 	up.DeviceTokenFile = cfg.Upstream.DeviceTokenFile
 	up.Qimei36 = cfg.Upstream.Qimei36
 	up.QimeiFile = cfg.Upstream.QimeiFile
+	up.DesktopInfoFile = cfg.Upstream.DesktopInfoFile
 	up.PassthroughIP = cfg.Upstream.PassthroughIP
 	// 全局兜底出口代理（config upstream.proxy_url）：账号 auth proxy_url 优先于本项。
 	up.SetGlobalProxyURL(cfg.Upstream.ProxyURL)
